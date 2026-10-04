@@ -11,15 +11,17 @@ The dual-axis solar tracker is an autonomous electro-mechanical system designed 
 
 ```mermaid
 flowchart TD
-    subgraph Power_Supply ["Power Supply Subsystem"]
-        DC_IN["7-12V DC Barrel Jack"] --> SW["Master Slide Switch"]
+    subgraph Power_Supply ["Power Supply Subsystem (High-Side Switched)"]
+        DC_IN["7-12V DC Barrel Jack"] --> SW["Master Slide Switch (Positive Leg)"]
         SW --> FUSE["2A Fuse"]
-        FUSE --> DIODE["1N5819 Schottky Diode"]
-        DIODE --> INA_SYS["INA219 #2 (0x41) System Rail Sensor"]
+        FUSE --> DIODE["3A Schottky Diode (SS34 / 1N5822)"]
+        DIODE --> INA_SYS["INA219 #2 (0x41) System Input Sensor"]
         INA_SYS --> LM2596["LM2596 Buck Converter (Outputs 5.00V)"]
-        LM2596 --> CAP_BANK["1000µF Low-ESR + 100nF MLCC"]
-        CAP_BANK --> SERVO_RAIL["5.0V Servo Power Rail (Perfboard/Terminals)"]
-        CAP_BANK --> BP_5V["Blue Pill 5V Pin -> Onboard 3.3V LDO"]
+        LM2596 --> TVS["5.6V TVS Overvoltage Clamp (1.5KE5.6A)"]
+        TVS --> CAP_BANK["1000µF Low-ESR + 100nF MLCC"]
+        CAP_BANK --> SERVO_RAIL["5.0V Dedicated Servo Power Rail"]
+        CAP_BANK --> ISO_DIODE["Schottky Diode (Back-feed Isolation)"]
+        ISO_DIODE --> BP_5V["Blue Pill 5V Pin -> Onboard 3.3V LDO"]
     end
 
     subgraph Controller ["STM32F103C8T6 Microcontroller Subsystem"]
@@ -61,22 +63,23 @@ Below is the verified parts list for building the dual-axis tracker with side-by
 | Item Description | Build Qty | Suggested Buy | Engineering Purpose & Selection Notes |
 | :--- | :---: | :---: | :--- |
 | **STM32F103C8T6 Blue Pill** | 1 | 2 | Main controller board (+ pin headers if unsoldered). Buy 2 in case of clone CPUTAPID issues or flash failure. |
-| **ST-Link V2 Debug Probe** | 1 | 1 | Hardware SWD programmer (connect `SWDIO`, `SWCLK`, `GND` only). |
+| **ST-Link V2 Debug Probe** | 1 | 1 | Hardware SWD programmer (connect `SWDIO`, `SWCLK`, `GND`, and **`NRST`**). |
 | **TowerPro MG90S Micro Servo** | 2 | 3 | Metal-gear actuators ($2.2\text{ kg}\cdot\text{cm}$ torque) for Azimuth & Elevation. Keep 1 spare. |
 | **GL5528 CdS Photoresistor (LDR)** | 4 | 6 | Light differential quadrant sensors. Extras allow tolerance matching. |
 | **INA219 I²C Power Sensor Module** | 3 | 4 | Must have solder pads for `A0`/`A1` address bridging (`0x40`, `0x41`, `0x44`). |
 | **SSD1306 0.96" I²C OLED Display** | 1 | 1 | Real-time telemetry dashboard (128×64 resolution, default address `0x3C`). |
 | **6 V 3 W Polycrystalline Solar Panel** | 2 | 2 | Matched pair from the same factory batch (1× Tracked DUT, 1× Fixed Reference). |
-| **10–12 Ω 5 W Wirewound Resistor** | 2 | 4 | MPP test load resistors. Measure with DMM and match within $\pm 0.1\ \Omega$. Aluminum or cement. |
+| **10–12 Ω 5 W Wirewound Resistor** | 2 | 4 | MPP test load resistors. Measure with DMM and match within $\pm 0.1\ \Omega$. Aluminum or cement (heatsinked). |
 | **LM2596 DC-DC Buck Converter Module** | 1 | 2 | High-efficiency step-down to regulated 5.00 V. Buy spare in case of pot misadjustment. |
 | **9 V 2 A DC Power Adapter** | 1 | 1 | 5.5×2.1 mm center-positive wall-plug supply for the entire system. |
 | **DC Barrel Jack (Female Socket)** | 1 | 1 | 5.5×2.1 mm chassis or breadboard-friendly socket. |
-| **SPST Slide Switch** | 1 | 1 | Master power toggle switch wired in series with barrel jack positive. |
-| **1N5819 Schottky Diode** | 1 | 3 | Reverse-polarity protection with low $0.35\text{–}0.45\text{ V}$ forward drop. |
+| **SPST Slide Switch** | 1 | 1 | Master power toggle switch wired in series with barrel jack positive line. |
+| **3 A Schottky Diode (SS34 / 1N5822)** | 1 | 3 | Reverse-polarity protection (3 A rated; replaces 1N5819 to safely exceed 2 A fuse rating). |
+| **5.6 V TVS Diode (1.5KE5.6A / SMBJ5.0A)**| 1 | 2 | Overvoltage clamp across 5V rail to protect electronics against buck regulator failure. |
 | **2 A Fuse (Glass or Resettable PPTC)** | 1 | 2 | Overcurrent protection against motor stalls or wiring shorts. |
 | **Tactile Pushbutton (6×6 mm)** | 1 | 2 | User interface on `PA4`: Short press = Mode toggle; Long press (>2s) = LDR calibration. |
-| **10 kΩ 1/4W Metal Film Resistors** | 6 | 20 | Indoor LDR dividers (4×), servo PWM floating pull-downs to GND (2×). |
-| **1.5 kΩ 1/4W Metal Film Resistors** | 4 | 10 | Outdoor LDR dividers (prevents direct tropical sunlight saturation). |
+| **3.3 kΩ – 4.7 kΩ Metal Film Resistors** | 4 | 10 | Universal compromise LDR dividers (operates linearly indoor & outdoor without swapping). |
+| **10 kΩ 1/4W Metal Film Resistors** | 2 | 10 | Servo PWM floating pull-downs to GND (2×). |
 | **4.7 kΩ 1/4W Metal Film Resistors** | 2 | 4 | Optional I²C bus pull-ups (fit only if bus modules lack onboard pull-ups). |
 | **10 nF Ceramic Capacitors (0.01 µF)** | 4 | 10 | High-frequency noise suppression capacitors on ADC input pins `PA0`–`PA3`. |
 | **100 nF Ceramic Capacitors (0.1 µF)** | 2 | 10 | Logic decoupling on Blue Pill and high-frequency bypass across servo power rail. |
@@ -89,18 +92,19 @@ Below is the verified parts list for building the dual-axis tracker with side-by
 | **Matte-Black Foamboard / 3D Print** | 1 | 1 | 35–40 mm tall cross divider creating directional shadows across the 4 LDRs. |
 | **Perfboard 7×9 cm + Half Breadboard** | 1 + 1 | 2 + 1 | Perfboard for high-current 5V/GND power star distribution; breadboard for MCU logic. |
 | **Screw Terminals or Wago 221 Connectors** | 1 pack | 1 pack | High-reliability, low-resistance junctions for star ground and 5 V distribution. |
-| **Pin-Header Socket Strips (Female)** | 1 strip | 1 strip | Sockets soldered on LDR board for easy swapping between 10 kΩ and 1.5 kΩ resistors. |
 | **Dupont Jumper Wires (M-F, F-F, M-M)** | ~40 each | 1 pack each | High-quality 20 cm jumper wires for modular interconnects. |
-| **Bench Hardware Kit** | 1 set | 1 set | 22 AWG hookup wire, heat-shrink tubing, M3 standoffs/nuts/bolts, cable ties, hot glue, nail polish. |
+| **Bench Hardware Kit** | 1 set | 1 set | 22 AWG hookup wire, heat-shrink tubing, M3 standoffs/nuts/bolts, cable ties, hot glue. |
 
 ---
 
 ## 3. Electrical Protection & Power Distribution
 
-### 3.1 Reverse-Polarity & Overcurrent Protection
-Connecting an incorrect center-negative power brick will destroy the LM2596, the INA219 high-side amplifiers, and the microcontroller instantly.
-* **Series Schottky Diode (1N5819):** Placed directly on the positive terminal of the barrel jack. It has a forward voltage drop of only $0.35\text{–}0.45\text{ V}$ at typical system currents ($200\text{–}400\text{ mA}$) and blocks reverse voltage up to $40\text{ V}$.
-* **In-Line 2 A Fuse:** A fast-acting 2 A glass fuse or a 2 A resettable polymeric PTC fuse is wired immediately before the diode to protect against catastrophic dead-shorts.
+### 3.1 Reverse-Polarity, Overvoltage & Overcurrent Protection
+Connecting an incorrect center-negative power brick or experiencing a buck converter failure will destroy sensitive components if unmitigated:
+* **High-Side Power Switch:** Wire the SPST power switch exclusively in series with the positive line coming from the DC barrel jack. Never switch ground, as sneaky return paths via ST-Link or chassis grounds will keep the board energized.
+* **3 A Schottky Diode (SS34 / 1N5822):** Placed in series on the positive rail after the fuse. The original 1N5819 is only rated for 1.0 A, which is inadequate when two servos stall ($\approx 1.2–1.4\text{ A}$ total) and leaves the diode vulnerable while the 2 A fuse remains intact. A 3 A part ensures the diode easily survives full stall loads.
+* **5.6 V Overvoltage TVS Diode (1.5KE5.6A):** Placed directly across the LM2596 5 V output rail. If the buck regulator's internal pass switch shorts collector-to-emitter, the TVS diode clamps the output to $\le 5.6\text{ V}$ and draws enough surge current to immediately blow the 2 A fuse, saving the servos and Blue Pill.
+* **In-Line 2 A Fuse:** A fast-acting 2 A glass or PPTC resettable fuse wired on the input positive rail.
 
 ### 3.2 LM2596 Pre-Flight Bench Trimming
 > [!CAUTION]
@@ -117,8 +121,8 @@ Connecting an incorrect center-negative power brick will destroy the LM2596, the
 * **Decoupling Capacitor Bank:** Solder a **$1000\ \mu\text{F}$ 16V low-ESR electrolytic capacitor** in parallel with a **$100\text{ nF}$ multi-layer ceramic capacitor (MLCC)** directly across the servo power distribution rail. The electrolytic capacitor supplies instantaneous peak charge during motor commutations, while the ceramic capacitor shunts high-frequency RF ringing.
 
 ### 3.4 Programmer & Interface Isolation Rules
-* **ST-Link 3.3V Contention:** When flashing or debugging while the system is powered from the barrel jack, **connect only `SWDIO`, `SWCLK`, and `GND`**. Disconnect the 3.3 V wire from the ST-Link header. Connecting both will force two active regulators to fight over the 3.3 V rail, causing thermal runaway or back-feeding into the host USB port.
-* **Micro-USB Hazard:** **Never plug in the Blue Pill's onboard micro-USB port while 5 V is supplied to the `5V` pin.** The Blue Pill links the micro-USB $V_{\text{BUS}}$ line directly to the board's 5 V header pin without ideal diode or power-path switching.
+* **ST-Link 3.3V Contention & NRST:** When flashing or debugging while the system is powered from the barrel jack, **connect `SWDIO`, `SWCLK`, `GND`, and `NRST`**. Disconnect the 3.3 V wire from the ST-Link header. Connecting both will force two active regulators to fight over the 3.3 V rail. Connecting `NRST` guarantees the programmer can halt the core even if the MCU enters sleep or disables debug pins.
+* **Micro-USB Hazard & Schottky Isolation:** **Never plug in the Blue Pill's onboard micro-USB port while 5 V is supplied to the `5V` pin**, or install a small Schottky diode in series between the LM2596 5 V rail and the Blue Pill's 5 V header pin to prevent dangerous back-feeding.
 
 ---
 
@@ -128,7 +132,7 @@ The STM32F103C8T6 offers multiplexed peripherals. The table below represents the
 
 | Pin Name | Physical Pin | Function / Alternate Mode | Connected Peripheral | Electrical Constraints / Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| **`PA0`** | Pin 10 | `ADC1_IN0` | Top-Left LDR Divider | **0 to 3.3 V strictly.** Not 5 V tolerant in analog mode. |
+| **`PA0`** | Pin 10 | `ADC1_IN0` | Top-Left LDR Divider | **0 to 3.3 V strictly.** $10\text{ nF}$ filter cap to GND. |
 | **`PA1`** | Pin 11 | `ADC1_IN1` | Top-Right LDR Divider | **0 to 3.3 V strictly.** $10\text{ nF}$ filter cap to GND. |
 | **`PA2`** | Pin 12 | `ADC1_IN2` | Bottom-Left LDR Divider | **0 to 3.3 V strictly.** $10\text{ nF}$ filter cap to GND. |
 | **`PA3`** | Pin 13 | `ADC1_IN3` | Bottom-Right LDR Divider| **0 to 3.3 V strictly.** $10\text{ nF}$ filter cap to GND. |
@@ -264,11 +268,25 @@ All telemetry devices communicate across a shared two-wire interface:
 | **INA219 #3** | Baseline Fixed PV | `0x44` | Solder bridge across **`A1`** | Measures $V_{\text{pv,fix}}$, $I_{\text{pv,fix}}$ on identical static panel. |
 | **SSD1306** | Real-Time User Dashboard | `0x3C` | Factory default setting | Displays comparative mW, mAh, tracking error, and system status. |
 
+> [!IMPORTANT]
+> **Star Grounding & Return Current Rule:**
+> The negative leads of both solar panels, the returns of both $10\ \Omega$ load resistors, all three INA219 GND pins, the LM2596 `IN−`/`OUT−`, the SSD1306 OLED GND, and the Blue Pill GND pin **must all terminate at the common star ground point on perfboard**.
+> The INA219 measures bus voltage relative to its own GND pin ($V_{\text{IN-}} - V_{\text{GND}}$). If the solar panel return or sensor grounds float relative to each other, the bus voltage reading will be invalid and fluctuating.
+
 ---
 
 ## 8. Production STM32 Firmware Implementation
 
-This code represents the complete, fully implemented `Core/Src/main.c` file. It compiles under STM32CubeIDE using the STM32F1xx HAL drivers with no missing dependencies or pseudocode.
+> [!TIP]
+> **Modular Source Tree Available:**
+> The complete, buildable, modular firmware codebase is organized in the [`Core/`](Core/) folder of this repository:
+> - **[`Core/Src/main.c`](Core/Src/main.c)**: Orchestrates non-blocking UI, boot-time I²C scanner, staggered servo startup, and telemetry loops.
+> - **[`Core/Src/stm32f1xx_hal_msp.c`](Core/Src/stm32f1xx_hal_msp.c)**: Full MSP callbacks for ADC1, TIM3, and I2C1 clocks and GPIO alternate-function setup.
+> - **[`Core/Src/ina219.c`](Core/Src/ina219.c)**: Driver using correct `0x399F` configuration and I²C bus lockup recovery.
+> - **[`Core/Src/ssd1306.c`](Core/Src/ssd1306.c) & [`Core/Src/ssd1306_fonts.c`](Core/Src/ssd1306_fonts.c)**: Complete text and numeric dashboard rendering engine.
+> - **[`Core/Src/tracker.c`](Core/Src/tracker.c)**: DWT 20 ms hum filter, runaway detection, clamped calibration, and dawn scan.
+> 
+> The monolithic listing below serves as an architectural code reference.
 
 ```c
 /* USER CODE BEGIN Header */

@@ -152,6 +152,16 @@ The INA219 measures current via its onboard 0.1 Ω shunt resistor between VIN+ a
 
 ![Full system wiring diagram showing STM32 Blue Pill connected to 4 LDRs, 2 servos, 3 INA219 modules, OLED, and LM2596 power supply from 9V barrel jack](images/system_wiring_overview.jpg)
 
+> [!CAUTION]
+> **CRITICAL SCHEMATIC ERRORS IN DIAGRAM — DO NOT WIRE DIRECTLY FROM THIS PICTURE:**
+> A document design review identified fatal drawing errors in `system_wiring_overview.jpg`:
+> 1. **Dead Short on 5 V Rail:** The diagram depicts INA219 #2 `IN+` coming off the 5 V buck output and `IN−` going to GND. This places the $0.1\ \Omega$ shunt resistor directly across the power supply, producing a destructive dead short.
+> 2. **Rail-to-Rail 5 V / 3.3 V Tie:** A red 3.3 V line inadvertently joins the 5 V net, injecting 5 V directly into the STM32's 3.3 V rail (absolute maximum rating is 4.0 V).
+> 3. **Low-Side Switch:** The switch is drawn in the ground leg, leaving sneaker ground paths through the ST-Link, PC USB, panel frames, and star ground.
+> 4. **USB Back-feed:** 5 V is drawn to the USB-connector side of the board, violating safe isolation rules.
+> 
+> **Resolution:** Do **not** build from this visual graphic. Follow the written architecture, the 51-point checklist, and the text specifications: the INA219 goes in series on the input line before the LM2596, the switch is placed on the positive line only, and 3.3 V and 5 V remain strictly isolated.
+
 ---
 
 # PART 1: Critical & High-Severity Findings
@@ -266,34 +276,32 @@ The manual claims the OLED serves as a "Real-time telemetry dashboard (displays 
 
 ---
 
-## 🟠 ISSUE 5 — INA219 Configuration Register Value Unverified
+## 🟢 ISSUE 5 — [RETRACTED / CLARIFIED] INA219 Configuration Register Value `0x399F` Is Correct
 
 **Location:** [main.c line 501](solar_tracker_hardware_manual.md#L501)
 
 ```c
-uint8_t cfg[3] = {0x00, 0x39, 0x9F}; // Comment says: 32V, 320mV Shunt, 12-bit Continuous
+uint8_t cfg[3] = {0x00, 0x39, 0x9F}; // 32V, ±320mV Shunt, 12-bit Continuous
 ```
 
-**Problem:** Decoding `0x399F` against the INA219 datasheet register map (Register 0x00):
-
-| Bits | Field | Binary | Value |
-|:---|:---|:---|:---|
-| 15–13 | RST, — | `001` | No reset |
-| 12–11 | BRNG | `11` | **Bus voltage range = 32 V** ✅ |
-| 10–9 | PG | `00` | **Shunt voltage range = ±40 mV (Gain /1)** ❌ |
-| 8–3 | BADC/SADC | `011001` | Mixed ADC settings |
-| 2–0 | MODE | `111` | Continuous shunt+bus ✅ |
-
-The comment says "320 mV shunt" (Gain /8) but the register value sets PG = `00`, which is ±40 mV (Gain /1). With a 0.1 Ω shunt, Gain /1 limits the measurable current to:
-
-$$I_{\max} = \frac{40\text{ mV}}{0.1\text{ Ω}} = 400\text{ mA}$$
-
-The panel's maximum power point current is ~520 mA, which **exceeds the shunt measurement range** and will clip/saturate.
-
-**Fix:** Set PG = `11` for ±320 mV (Gain /8):
-```c
-uint8_t cfg[3] = {0x00, 0x3F, 0x9F}; // 32V bus, ±320mV shunt (Gain /8), 12-bit, continuous
-```
+> [!NOTE]
+> **Audit Correction:** The original audit finding claimed `0x399F` selected Gain /1 ($\pm 40\text{ mV}$) because it misidentified bits [10:9] as the PG field. In the official Texas Instruments INA219 datasheet (Register 0x00 Configuration Register):
+> - **Bits [12:11] are PG (PGA Gain & Range)**.
+> - Bits [10:7] are BADC (Bus ADC Resolution/Averaging).
+> - Bits [6:3] are SADC (Shunt ADC Resolution/Averaging).
+> - Bits [2:0] are MODE (Operating Mode).
+>
+> Decoding `0x399F` ($\mathbf{0011}\ \mathbf{1001}\ \mathbf{1001}\ \mathbf{1111}_2$):
+> | Bits | Field | Binary | Setting |
+> |:---|:---|:---:|:---|
+> | 15–14 | RST, — | `00` | Normal operation |
+> | 13 | BRNG | `1` | **32 V Bus Voltage Range** ✅ |
+> | 12–11 | PG | `11` | **$\pm 320\text{ mV}$ Shunt Range (Gain /8)** ✅ |
+> | 10–7 | BADC | `0010` | 12-bit resolution (532 µs conversion) ✅ |
+> | 6–3 | SADC | `0010` | 12-bit resolution (532 µs conversion) ✅ |
+> | 2–0 | MODE | `111` | Shunt and Bus, Continuous ✅ |
+>
+> **Conclusion:** `0x399F` is the factory power-on default and **correctly configures the INA219 for $\pm 320\text{ mV}$ full-scale shunt voltage** (up to $3.2\text{ A}$ across a $0.1\ \Omega$ shunt). There is **no 400 mA clipping**. The audit's suggested replacement (`0x3F9F`) inadvertently set BADC to `1111` (128-sample averaging, 68.1 ms conversion), which slows telemetry throughput. **Keep `0x399F`.**
 
 ---
 
@@ -367,7 +375,7 @@ static inline void DWT_Delay_us(uint32_t us) {
 
 ---
 
-## 🟠 ISSUE 9 — Demo Mode Never Stops PWM (Continuous Servo Buzz)
+## 🟡 ISSUE 9 — PWM De-energizing vs. Servo Holding Torque Trade-Off
 
 **Location:** [main.c lines 464–476](solar_tracker_hardware_manual.md#L464-L476)
 
@@ -383,29 +391,20 @@ if (moved) {
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
         HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
     }
-    // Demo mode: PWM is never stopped!
 }
 ```
 
-**Problem:** In `MODE_DEMO`, PWM starts but is never stopped. The servos receive continuous PWM signals indefinitely. This causes:
-- Constant servo buzz/whine from the PID loop inside the servo trying to hold position
-- Continuous power draw of ~10–50 mA per servo (even when not moving)
-- Mechanical gear wear from constant micro-adjustments
-
-**Fix:** Add a delay and stop even in demo mode:
-```c
-if (moved) {
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pan_pulse);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, tilt_pulse);
-
-    uint32_t settle_ms = (current_mode == MODE_FIELD) ? 400 : 250;
-    HAL_Delay(settle_ms);
-    HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Stop(&htim3, TIM_CHANNEL_2);
-}
-```
+> [!WARNING]
+> **Engineering Caveat on Stopping PWM:** While calling `HAL_TIM_PWM_Stop()` eliminates quiescent servo buzzing and saves ~10–50 mA of idle current, **it completely de-energizes the servo's internal H-bridge driver, dropping holding torque to zero**.
+> 
+> In an outdoor solar tracker:
+> - Wind gusts exert aerodynamic lift and drag on the $150\times 150\text{ mm}$ panel surface.
+> - Any slight offset between the pivot axis and the assembly's Center of Gravity (CG) creates an ongoing gravitational turning moment.
+> - Without active holding torque, the panel will back-drive the MG90S spur gears, sag downwards, or flutter in moderate breezes.
+>
+> **Best Practice Recommendation:**
+> 1. For outdoor field operation without worm-drive gearboxes, **keep PWM pulses running** to maintain holding torque against wind loads.
+> 2. If low-power sleep is strictly necessary, ensure the panel's Center of Gravity is counterbalanced within $\pm 1\text{ mm}$ of the elevation pivot axis, and implement an automatic flat-stow routine if wind velocity rises.
 
 ---
 
@@ -555,8 +554,8 @@ uint32_t last_telemetry_tick = HAL_GetTick(); // Fix: init to current time
 
 ---
 
-## 🟡 ISSUE 17 — INA219 Bus Voltage Calculation Uses Non-Standard Formula
-
+## 🟢 ISSUE 17 — [RETRACTED / CLARIFIED] INA219 Bus Voltage Calculation Overflow Risk
+ 
 **Location:** [main.c lines 514–516](solar_tracker_hardware_manual.md#L514-L516)
 
 ```c
@@ -564,18 +563,14 @@ int16_t raw_v = (int16_t)((data[0] << 8) | data[1]);
 *voltage = (float)((raw_v >> 3) * 4) * 0.001f;
 ```
 
-**Analysis:** The INA219 bus voltage register (0x02) has bits [15:3] containing the voltage value and bits [2:0] containing flags (CNVR, OVF, reserved). The LSB of the shifted value is 4 mV.
-
-- `raw_v >> 3` extracts the voltage field
-- `* 4` scales by 4 mV per LSB
-- `* 0.001f` converts from mV to V
-
-This is correct ✅, but the intermediate calculation `(raw_v >> 3) * 4` can overflow for a signed 16-bit value if `raw_v >> 3` exceeds 8191 (which represents 32.764 V — unlikely for a 6 V panel but possible for the 9 V system rail).
-
-**Fix:** Cast to `int32_t` before multiplication:
-```c
-*voltage = (float)(((int32_t)(raw_v >> 3)) * 4) * 0.001f;
-```
+> [!NOTE]
+> **Audit Correction:** The original audit flagged this as an overflow risk. However, under the ISO C integer promotion rules on an ARM Cortex-M3 (32-bit architecture), `raw_v` is automatically promoted to a signed 32-bit `int` prior to the bit-shift and multiplication.
+> 
+> Furthermore:
+> - Even on a 16-bit architecture, at 9 V: $\text{raw\_v} \gg 3 \approx 2250$, and $2250 \times 4 = 9000$, well within the $+32,767$ limit of a 16-bit signed integer.
+> - An overflow of a 16-bit integer could only theoretically occur above $\frac{32767}{4} \times 4\text{ mV} = 32.764\text{ V}$, which exceeds the INA219's maximum operating rating (26 V).
+> 
+> **Conclusion:** There is **no arithmetic overflow**. For code elegance and single-operation floating-point conversion, writing `*voltage = (float)(raw_v >> 3) * 0.004f;` is recommended.
 
 ---
 
@@ -760,42 +755,159 @@ Use this checklist during assembly to verify every connection before power-on.
 
 ---
 
+# PART 4: Document Design Review Additions & Gaps the Audit Missed
+
+A rigorous document-level design review identified critical hardware drawing bugs, audit errors, and functional gaps in the original implementation.
+
+---
+
+## 🔴 ISSUE 24 — Critical Schematic Drawing Errors in System Wiring Diagram
+
+**Location:** `images/system_wiring_overview.jpg`
+
+**Hazards Identified:**
+1. **Dead Short Across 5 V Rail:** The diagram shows INA219 #2 `IN+` tied to the LM2596 5 V output and `IN−` tied directly to GND. With an onboard shunt of $0.1\ \Omega$, this draws $I = 5\text{ V} / 0.1\ \Omega = 50\text{ A}$, destroying the sensor, buck converter, or board traces immediately on power-up.
+2. **5 V Tied to 3.3 V Rail:** The 3.3 V pull-up line is shown intersecting the 5 V net, exposing the STM32's 3.3 V rail directly to 5 V. The STM32F103 absolute maximum supply voltage is $4.0\text{ V}$; this destroys the MCU logic instantly.
+3. **Low-Side Power Switch:** The power switch is drawn in the negative return (GND) leg. Low-side switching leaves all components energized at positive potential with sneaky return paths through the ST-Link ground (via PC USB chassis ground), panel frames, and star ground.
+
+**Fix:**
+- Always wire the master switch in the **high-side $(+)$ positive leg** directly after the barrel jack.
+- Wire INA219 #2 in **series** on the high-side input line before the LM2596.
+- Strictly isolate the 5 V rail from the 3.3 V rail.
+
+---
+
+## 🟠 ISSUE 25 — 1N5819 Reverse-Polarity Diode Underrated (1.0 A)
+
+**Location:** Section 2 BOM and Power Architecture
+
+**Problem:** The 1N5819 Schottky diode is rated for $1.0\text{ A}$ average forward current. Under combined tracking motion, two MG90S servos stalling or driving against wind gusts draw $0.5–0.8\text{ A}$ each ($1.0–1.6\text{ A}$ total), plus MCU and converter quiescent draw. The 2 A fuse will not protect the 1 A diode; the diode will overheat, degrade, or fail shorted under sustained load.
+
+**Fix:** Upgrade to a **3 A Schottky diode** (1N5822, SS34, or SR360) or an active P-MOSFET reverse-polarity protection circuit (e.g., AO3401 / IRF9540 with zener gate clamp).
+
+---
+
+## 🟠 ISSUE 26 — Unprotected LM2596 Buck Overvoltage Failure Mode
+
+**Problem:** Cheap switch-mode buck modules typically fail with the internal bipolar switch shorted ($V_{\text{CE}}$ breakdown). If the LM2596 fails short, the full 9–12 V input rail is delivered straight to the 5 V rail, destroying the servos, OLED, and Blue Pill.
+
+**Fix:** Install a **5.6 V TVS diode** (e.g., 1.5KE5.6A or SMBJ5.0A) or an active thyristor crowbar across the 5 V output rail. If the buck regulator shorts, the TVS clamps the transient and blows the input 2 A fuse.
+
+---
+
+## 🟠 ISSUE 27 — Blue Pill 5V Back-Feeding USB & Missing ST-Link NRST
+
+**Problem:** 
+1. Powering the Blue Pill via the 5 V header pin while micro-USB is plugged in risks back-feeding between the buck regulator and the host computer.
+2. Connecting only SWDIO, SWCLK, and GND without **NRST** can permanently lock out the ST-Link programmer if the firmware halts, enters low-power stop modes, or accidentally reconfigures the debug pins via `AFIO_MAPR`.
+
+**Fix:**
+- Place a Schottky diode between LM2596 OUT+ and the Blue Pill 5V pin, and program exclusively over SWD.
+- Connect the **NRST** line between the ST-Link V2 and Blue Pill RST pin for hardware reset hold during programming.
+
+---
+
+## 🟡 ISSUE 28 — Missing Boot-Time I²C Scanner
+
+**Problem:** Many multi-drop I²C modules come with solder bridges pre-populated or omitted by different manufacturers, and I²C address assignments can easily conflict. The firmware assumed devices exist without verification.
+
+**Fix:** Add a boot-time I²C bus scanner using `HAL_I2C_IsDeviceReady()` that loops through addresses `0x01`–`0x77`, logging detected devices and asserting an error code if `0x3C`, `0x40`, `0x41`, or `0x44` are missing.
+
+---
+
+## 🟡 ISSUE 29 — Calibration Division-by-Zero and Sensor Fault Clamping
+
+**Problem:** In `Calibrate_Sensor_Offsets()`, the normalization multiplier is computed as `cal_factors[i] = avg / raw_ldr[i]`. If an LDR is disconnected, has a cold solder joint, or shorts to ground, `raw_ldr[i] == 0`, leading to a floating-point division by zero (`+Inf` or `NaN`), permanently corrupting tracking math.
+
+**Fix:** Clamp raw sensor readings ($50 \le \text{reading} \le 4000$) and clamp the resulting calibration multiplier ($0.25 \le \text{factor} \le 4.0$).
+
+---
+
+## 🟡 ISSUE 30 — Missing Startup Search & Lost-Sun Recovery Routine
+
+**Problem:** The 35–40 mm shadow baffle restricts the sensor head field of view to an acceptance half-angle of $\theta \approx \arctan(20\text{ mm} / 35\text{ mm}) \approx 30^\circ$. If the tracker gets out of alignment (e.g. dawn restart, heavy cloud cover clearing after 2 hours), all 4 LDRs read diffuse light, differential error is below the deadband, and the tracker remains stationary forever.
+
+**Fix:** Implement an automated acquisition sweep: if all 4 sensors read low/uniform error in daytime without finding a gradient, execute an expanding raster or pan sweep to acquire solar flux.
+
+---
+
+## 🟡 ISSUE 31 — Missing Closed-Loop Runaway Protection
+
+**Problem:** If `PAN_DIR` or `TILT_DIR` polarity is reversed, or an LDR pair is wired backwards, the tracking loop executes positive feedback. Every step moves the tracker *further* from the sun, driving the servos continuously into mechanical end-stops.
+
+**Fix:** Track error magnitude progression. If tracking error does not decrease after 5 consecutive steps in one direction, immediately halt actuation and trigger an LED fault blink.
+
+---
+
+## 🟡 ISSUE 32 — Simultaneous Servo Reset Inrush & Staggered Initialization
+
+**Problem:** Centering both servos to 1500 µs at reset at the exact same millisecond draws an instantaneous stall-current spike exceeding $1.5\text{ A}$, causing severe voltage sag on the 5 V rail and potentially browning out the STM32.
+
+**Fix:** Stagger servo initialization: center Pan, wait 300 ms for current settle, then center Tilt.
+
+---
+
+## 🟡 ISSUE 33 — Mechanical Torque Margin, 180° Azimuth Limitation, and Resistor Heat
+
+**Observations & Mitigations:**
+1. **Torque Margin:** Static load is $0.88\text{ kg}\cdot\text{cm}$ against a stall rating of $2.0\text{ kg}\cdot\text{cm}$ ($< 2.3\times$ margin). Wind gusts on a $150\times 150\text{ mm}$ panel exceed this margin. Add an aerodynamic counterweight, shorten lever arms, or upgrade to MG996R / worm gears.
+2. **Pan Sweep:** Summer sun arc at higher latitudes exceeds $220^\circ$, while standard servos travel only $\sim 180^\circ$. Align the assembly due South (Northern Hemisphere) to center the sweep between 09:00 and 17:00 solar time.
+3. **Resistor Dissipation:** Dual $10\ \Omega$ load resistors dissipate $\approx 2 \times 2.7\text{ W} = 5.4\text{ W}$. They must be mounted on an aluminum bracket isolated from PLA parts (PLA deforms at $55^\circ\text{C}$).
+4. **LDR Resistor Compromise:** Instead of swapping $10\text{ k}\Omega$ (indoor) and $1.5\text{ k}\Omega$ (outdoor), use a single compromise value of **$3.3\text{ k}\Omega$ to $4.7\text{ k}\Omega$** to eliminate manual resistor replacement.
+
+---
+
 # Summary of All Findings
 
-| # | Severity | Category | Issue |
-|:---:|:---:|:---|:---|
-| 1 | 🔴 | Firmware | System rail INA219 read overwrites all three fields with same pointer |
-| 2 | 🔴 | Firmware | Missing HAL MSP init callbacks — no peripheral clocks or GPIO alt-function setup |
-| 3 | 🔴 | Firmware | Missing `Error_Handler()` — code won't compile |
-| 4 | 🔴 | Firmware | OLED has no text rendering — display stays blank forever |
-| 5 | 🟠 | Firmware | INA219 config register sets Gain /1 (±40 mV) — clips at 400 mA, panel delivers 520 mA |
-| 6 | 🟠 | Firmware | INA219 calibration register written but never used (harmless but confusing) |
-| 7 | 🟠 | Firmware | Spin-wait loop timing is compiler/optimization dependent |
-| 8 | 🟠 | Firmware | Night parking thresholds labeled "LUX" but compared against raw ADC sum |
-| 9 | 🟠 | Firmware | Demo mode never stops PWM — servos buzz continuously |
-| 10 | 🟠 | Electrical | System INA219 placed on input side of buck — measures input power, not 5V rail |
-| 11 | 🟠 | Firmware | Button handler blocks main loop during press |
-| 12 | 🟡 | Electrical | 3.3V LDO current budget is tight on cheap clone boards |
-| 13 | 🟡 | Mechanical | Servo pulse limits (600–2400 µs) may exceed physical safe range |
-| 14 | 🟡 | Documentation | PA0 missing 10 nF cap note in pinout table |
-| 15 | 🟡 | Firmware | Calibration offsets lost on power cycle (RAM only) |
-| 16 | 🟡 | Firmware | mAh accumulation first-iteration error due to `last_telemetry_tick = 0` |
-| 17 | 🟡 | Firmware | Bus voltage intermediate calc could overflow on 9V rail readings |
-| 18 | 🟢 | Electrical | I²C pull-up stacking risk with 4 modules + external resistors |
-| 19 | 🟢 | Firmware | No watchdog timer — system never recovers from hangs |
-| 20 | 🟢 | Documentation | Block diagram INA219 #2 placement description is ambiguous |
-| 21 | 🟢 | Firmware | `abs()` used on `int32_t` — should be `labs()` for portability |
-| 22 | 🟢 | Firmware | No I²C bus recovery mechanism for the known STM32F1 I²C errata |
-| 23 | 🟢 | Documentation | Baffle height inconsistent between diagram (35 mm) and text (35–40 mm) |
+| # | Severity | Category | Issue | Status / Verdict |
+|:---:|:---:|:---|:---|:---|
+| 1 | 🔴 | Firmware | System rail INA219 read overwrites all three fields with same pointer | **Confirmed blocker — Fixed in source** |
+| 2 | 🔴 | Firmware | Missing HAL MSP init callbacks — no peripheral clocks or GPIO alt-function setup | **Confirmed blocker — Fixed in source** |
+| 3 | 🔴 | Firmware | Missing `Error_Handler()` — code won't compile | **Confirmed blocker — Fixed in source** |
+| 4 | 🔴 | Firmware | OLED has no text rendering — display stays blank forever | **Confirmed blocker — Fixed in source** |
+| 5 | 🟢 | Firmware | INA219 config register sets Gain /1 (±40 mV) — claimed clipping at 400 mA | **RETRACTED: 0x399F default has PG=11 (±320 mV); no clipping** |
+| 6 | 🟠 | Firmware | INA219 calibration register written but never used | **Confirmed: raw shunt voltage math used instead** |
+| 7 | 🟠 | Firmware | Spin-wait loop timing is compiler/optimization dependent | **Confirmed: Replaced with hardware DWT cycle counter** |
+| 8 | 🟠 | Firmware | Night parking thresholds labeled "LUX" but compared against raw ADC sum | **Confirmed: Renamed and calibrated to ADC counts** |
+| 9 | 🟡 | Firmware | Demo mode never stops PWM vs holding torque loss | **REVISED: Must keep PWM active for holding torque against wind** |
+| 10 | 🟠 | Electrical | System INA219 placed on input side of buck — measures input power, not 5V rail | **Confirmed: Documented as input-side telemetry** |
+| 11 | 🟠 | Firmware | Button handler blocks main loop during press | **Confirmed: Replaced with non-blocking state machine** |
+| 12 | 🟡 | Electrical | 3.3V LDO current budget is tight on cheap clone boards | **Confirmed: Added decoupling recommendation** |
+| 13 | 🟡 | Mechanical | Servo pulse limits (600–2400 µs) may exceed physical safe range | **Confirmed: Calibrated to 750–2250 µs safe zone** |
+| 14 | 🟡 | Documentation | PA0 missing 10 nF cap note in pinout table | **Confirmed: Corrected in documentation** |
+| 15 | 🟡 | Firmware | Calibration offsets lost on power cycle (RAM only) | **Confirmed: Stored in RAM with safe fallback bounds** |
+| 16 | 🟡 | Firmware | mAh accumulation first-iteration error due to `last_telemetry_tick = 0` | **Confirmed: Initialized to `HAL_GetTick()`** |
+| 17 | 🟢 | Firmware | Bus voltage intermediate calc could overflow on 9V rail readings | **RETRACTED: 32-bit integer promotion prevents overflow** |
+| 18 | 🟢 | Electrical | I²C pull-up stacking risk with 4 modules + external resistors | **Confirmed: Checked via I²C scan before adding pull-ups** |
+| 19 | 🟢 | Firmware | No watchdog timer — system never recovers from hangs | **Confirmed: Added 2-second IWDG** |
+| 20 | 🟢 | Documentation | Block diagram INA219 #2 placement description is ambiguous | **Confirmed: Clarified in manual and schematics** |
+| 21 | 🟢 | Firmware | `abs()` used on `int32_t` — should be `labs()` for portability | **Confirmed: Standardized on portable integer math** |
+| 22 | 🟢 | Firmware | No I²C bus recovery mechanism for the known STM32F1 I²C errata | **Confirmed: Added 9-clock SCL bus recovery routine** |
+| 23 | 🟢 | Documentation | Baffle height inconsistent between diagram (35 mm) and text (35–40 mm) | **Confirmed: Standardized to 35–40 mm** |
+| 24 | 🔴 | Electrical | Wiring diagram dead short (shunt across 5V/GND) and 5V/3.3V rail tie | **CRITICAL: Added warnings; redrawn architecture** |
+| 25 | 🟠 | Electrical | 1N5819 diode rated 1A with 2A fuse | **Confirmed: Upgraded to 3A Schottky (1N5822 / SS34)** |
+| 26 | 🟠 | Electrical | LM2596 pass-switch failure can send 9–12V to 5V rail | **Confirmed: Added 5.6V TVS overvoltage clamp** |
+| 27 | 🟠 | Electrical | Blue Pill 5V backfeed to USB & missing ST-Link NRST pin | **Confirmed: Added Schottky isolation & wired NRST** |
+| 28 | 🟡 | Firmware | Missing boot-time I²C bus scan | **Confirmed: Added `I2C_Scan()` in startup sequence** |
+| 29 | 🟡 | Firmware | Calibration division-by-zero if sensor disconnected | **Confirmed: Added input and factor clamp limits** |
+| 30 | 🟡 | Firmware | Missing startup search & lost-sun recovery routine | **Confirmed: Added raster scan routine** |
+| 31 | 🟡 | Firmware | Missing closed-loop runaway protection | **Confirmed: Added 5-step non-decreasing error trip** |
+| 32 | 🟡 | Firmware | Simultaneous servo reset inrush current spike | **Confirmed: Staggered pan and tilt centering** |
+| 33 | 🟡 | Mechanical | Servo torque margin, wind load, 180° pan limit, resistor heat | **Confirmed: Documented mechanical design rules** |
 
 > [!IMPORTANT]
-> **Issues 1–4 are compilation/runtime blockers.** The firmware will not compile (Issue 3), and even if patched, the OLED stays blank (Issue 4), system telemetry is corrupted (Issue 1), and no peripheral actually initializes (Issue 2). Fix all four before flashing.
+> **Summary of Essential Actions Before Power-On:**
+> 1. Do not follow the graphic diagram `images/system_wiring_overview.jpg` directly.
+> 2. Ensure switch is on the positive line, 3.3V and 5V rails never touch, and INA219 is in series with the input line.
+> 3. Use 3A Schottky and 5.6V TVS clamp.
+> 4. Use the modular firmware codebase in `Core/` which resolves all blockers and implements the missing protections.
 
 > [!TIP]
-> **Recommended first-power-on sequence after fixing the firmware:**
-> 1. Trim LM2596 to 5.00 V (DMM on OUT+/OUT−, no loads connected)
-> 2. Connect Blue Pill only (no servos, no I²C devices) — verify 3.3 V pin reads 3.30 V
-> 3. Flash firmware via ST-Link (SWDIO + SWCLK + GND only)
-> 4. Connect LDR dividers — verify PA0–PA3 read 0.1–3.1 V with flashlight
-> 5. Connect OLED and INA219s — run I²C scan, verify 0x3C, 0x40, 0x41, 0x44
-> 6. Connect servos last — verify no resets, check 1000 µF cap is installed
+> **Recommended first-power-on sequence:**
+> 1. Continuity check with DMM (verify 5V, 3.3V, and GND have no mutual shorts).
+> 2. Trim LM2596 to 5.00 V with no loads connected.
+> 3. Connect Blue Pill only — verify 3.3V pin reads 3.30 V.
+> 4. Flash firmware via ST-Link (SWDIO + SWCLK + GND + NRST).
+> 5. Connect LDR dividers (with 3.3k–4.7kΩ resistors) and verify ADC readings.
+> 6. Connect OLED and INA219s — verify I²C scan reports 0x3C, 0x40, 0x41, 0x44.
+> 7. Connect servos last (staggered startup enabled) with current-limited bench supply set to 1 A.

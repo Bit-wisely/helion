@@ -1,4 +1,4 @@
-﻿# ☀️ Helion — High-Precision Dual-Axis Solar Tracker & Telemetry System
+# ☀️ Helion — High-Precision Dual-Axis Solar Tracker & Telemetry System
 
 [![STM32](https://img.shields.io/badge/Microcontroller-STM32F103C8T6-blue.svg)](https://www.st.com/en/microcontrollers-microprocessors/stm32f103c8.html)
 [![Sensors](https://img.shields.io/badge/Sensors-3x%20INA219%20%7C%204x%20GL5528%20LDR-orange.svg)]()
@@ -13,12 +13,16 @@
 
 ![Complete System Wiring Overview](images/system_wiring_overview.jpg)
 
+> [!CAUTION]
+> **SCHEMATIC CAUTION — DO NOT WIRE DIRECTLY FROM THE OVERVIEW DRAWING:**
+> The original graphical diagram `images/system_wiring_overview.jpg` contains serious drawing errors: a dead short across 5 V through the INA219 shunt, an accidental 5 V-to-3.3 V rail tie, and a low-side power switch. Always follow the written specifications, the 51-point checklist in the audit report, and the corrected architecture below.
+
 ### Core Capabilities
-* **Active Dual-Axis Tracking:** Pan (Azimuth) and Tilt (Elevation) controlled by metal-gear MG90S servos with pulse-gated power reduction.
+* **Active Dual-Axis Tracking:** Pan (Azimuth) and Tilt (Elevation) controlled by metal-gear MG90S servos with continuous pulse-gated holding torque against wind gusts.
 * **Normalized Quad-LDR Sensing:** Mathematical error normalization algorithm ($\pm 100\%$ scale) immune to ambient room lighting, cloud cover, and seasonal brightness changes.
 * **Triple INA219 Telemetry:** Simultaneous high-side voltage, current, and power logging over I²C (`0x40`: Tracked Panel, `0x41`: System Input Rail, `0x44`: Fixed Reference Panel).
 * **Baseline Benchmarking:** Direct comparative yield tracking against an identical static solar panel using matched $10\ \Omega$ maximum power point load resistors.
-* **Reverse Polarity & Surge Protection:** Schottky diode protection, 2 A fuse, low-ESR $1000\ \mu\text{F}$ inrush suppression bank, and isolated programmer lines.
+* **Reverse Polarity, TVS & Surge Protection:** 3 A Schottky diode protection, 2 A fuse, 5.6 V overvoltage TVS clamp, low-ESR $1000\ \mu\text{F}$ inrush suppression bank, and isolated programmer lines with hardware NRST.
 
 ---
 
@@ -27,21 +31,22 @@
 | Item Description | Build Qty | Suggested Buy | Purpose & Selection Notes |
 |:---|:---:|:---:|:---|
 | **STM32F103C8T6 Blue Pill** | 1 | 2 | Main ARM Cortex-M3 controller board running @ 72 MHz |
-| **ST-Link V2 Debugger** | 1 | 1 | Hardware SWD programmer (SWDIO, SWCLK, GND only) |
+| **ST-Link V2 Debugger** | 1 | 1 | Hardware SWD programmer (SWDIO, SWCLK, GND, and **NRST**) |
 | **TowerPro MG90S Servo** | 2 | 3 | Metal-gear servos ($2.2\text{ kg}\cdot\text{cm}$) for Pan & Tilt |
 | **GL5528 CdS LDR** | 4 | 6 | Light differential quadrant sensors with 35–40mm shadow baffle |
 | **INA219 I²C Power Module** | 3 | 4 | Multi-drop power sensor with solder pads for A0/A1 addressing |
 | **SSD1306 0.96" OLED** | 1 | 1 | Real-time telemetry dashboard (128×64 resolution, address `0x3C`) |
 | **6V 3W Polycrystalline Panel** | 2 | 2 | Matched pair (1× Tracked DUT, 1× Fixed Reference) |
-| **10–12 Ω 5W Resistor** | 2 | 4 | MPP test load resistors matched within $\pm 0.1\ \Omega$ |
+| **10–12 Ω 5W Resistor** | 2 | 4 | MPP test load resistors matched within $\pm 0.1\ \Omega$ (heatsinked) |
 | **LM2596 DC-DC Buck Converter** | 1 | 2 | High-efficiency step-down to regulated 5.00 V |
 | **9 V 2 A DC Power Adapter** | 1 | 1 | Main system wall supply (5.5×2.1 mm center-positive) |
-| **DC Barrel Jack (Female)** | 1 | 1 | Chassis socket with series slide switch & 2A fuse |
-| **1N5819 Schottky Diode** | 1 | 3 | Reverse-polarity protection ($0.35\text{ V}$ forward drop) |
+| **DC Barrel Jack (Female)** | 1 | 1 | Chassis socket with positive-line series slide switch & 2A fuse |
+| **3 A Schottky Diode (SS34 / 1N5822)** | 1 | 3 | Reverse-polarity protection (3 A rated; replaces 1N5819) |
+| **5.6 V TVS Diode (1.5KE5.6A / SMBJ5.0A)**| 1 | 2 | Overvoltage clamp across 5V rail against buck regulator failure |
 | **2 A Fuse (Glass/PPTC)** | 1 | 2 | Overcurrent protection against motor stalls |
 | **Tactile Pushbutton** | 1 | 2 | PA4 user interface (Short = Mode Toggle, Long = Calibrate) |
-| **10 kΩ Resistors** | 6 | 20 | Indoor LDR dividers (4×) & servo signal pull-downs (2×) |
-| **1.5 kΩ Resistors** | 4 | 10 | Outdoor LDR dividers (prevents direct sun saturation) |
+| **3.3 kΩ – 4.7 kΩ Resistors** | 4 | 10 | Universal compromise LDR dividers (works indoor & outdoor) |
+| **10 kΩ Resistors** | 2 | 10 | External servo signal pull-downs (PA6 & PA7) |
 | **1000 µF 16V Electrolytic Cap** | 1 | 2 | Low-ESR inrush reservoir across 5V servo rail |
 
 ---
@@ -99,25 +104,34 @@ This repository contains two exhaustive engineering manuals for building and deb
    * System Block Architecture & Mathematical Models
    * Optical Shadow Baffle Geometry & Photometric Curves
    * Mechanical Center-of-Gravity (CG) Balancing & Bearing Design
-   * Complete Production Firmware C Code (`main.c`)
+   * Circuit Wiring Rules, Overvoltage TVS Protection & Resistor Compromise
    * Solar Harvesting Experimental Benchmarking Protocol
 
 2. 🔍 **[Hardware Audit & Wiring Verification Report](hardware_audit_report.md)**
-   * Audit of 23 Electrical, Firmware, and Mechanical Concerns (Categorized by Critical 🔴, High 🟠, Medium 🟡, Low 🟢)
-   * Fixes for Firmware Initialization, Buffer Overwrites, and Timer/ADC Bugs
+   * Audit of 33 Electrical, Firmware, and Mechanical Points
+   * Clarifications on INA219 Register Defaults, Holding Torque & Integer Promotion
    * 51-Point Component-by-Component Bench Assembly & Connection Verification Checklist
+
+3. 💻 **[Production Firmware Source Code](Core/)**
+   * Production-grade, modular STM32 HAL C codebase (`Core/Inc`, `Core/Src`)
+   * Fully implemented SSD1306 OLED font and real-time dashboard rendering engine
+   * Hardware DWT cycle counter microsecond delay for 20 ms / 50 Hz mains-hum rejection
+   * Boot-time I²C scanner, staggered servo soft-start, runaway protection, and dawn acquisition sweep
 
 ---
 
 ## ⚡ Quick Start & Pre-Power Commissioning
 
-1. **Trim Power Output:** Connect 9 V supply to LM2596 input. DMM across `OUT+`/`OUT-`. Adjust brass screw until reading exactly **$5.00\text{ V} \pm 0.05\text{ V}$**.
-2. **Flash MCU:** Connect ST-Link V2 using `SWDIO`, `SWCLK`, `GND`. *Do NOT connect 3.3V wire when powered via LM2596.*
-3. **Set I²C Addresses:**
+1. **Continuity & Short Check:** With power OFF, verify with a multimeter that `5V`, `3.3V`, and `GND` are completely isolated from each other.
+2. **Trim Power Output:** Connect 9 V supply to LM2596 input with nothing attached to output. Measure with DMM across `OUT+`/`OUT-`. Adjust trimmer screw until reading exactly **$5.00\text{ V} \pm 0.05\text{ V}$**.
+3. **Flash MCU:** Connect ST-Link V2 using `SWDIO`, `SWCLK`, `GND`, and `NRST`. *Do NOT connect the ST-Link 3.3V wire when powered via LM2596.* Flash the firmware from `Core/`.
+4. **Set I²C Addresses:**
    * INA219 #1 (Tracked Panel): Leave A0 & A1 open (`0x40`)
    * INA219 #2 (System Power): Bridge **A0** (`0x41`)
    * INA219 #3 (Fixed Panel): Bridge **A1** (`0x44`)
-4. **Calibrate Sensors:** Hold button on `PA4` for >2s under uniform lighting to store relative LDR offset calibration factors.
+5. **Verify I²C Bus Scan:** Confirm all 4 devices (`0x3C`, `0x40`, `0x41`, `0x44`) are detected on startup.
+6. **Connect Servos Last:** Power servos via a current-limited bench supply set to 1 A initially to verify smooth staggered initialization.
+7. **Calibrate Sensors:** Hold button on `PA4` for >2s under uniform lighting to store relative LDR offset calibration factors.
 
 ---
 
