@@ -1,0 +1,17 @@
+# Compiled binaries and object files
+*.exe
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+
+# Build directories
+build/
+Debug/
+Release/
+
+# Temporary files
+*.tmp
+*~
+.DS_Store

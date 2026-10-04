@@ -98,7 +98,7 @@
 
 ## 📚 Complete Project Documentation
 
-This repository contains two exhaustive engineering manuals for building and debugging the system:
+This repository contains exhaustive engineering documentation, design reviews, firmware, and test suites:
 
 1. 📖 **[Dual-Axis Solar Tracker: Complete Hardware Engineering Manual & Implementation Guide](solar_tracker_hardware_manual.md)**
    * System Block Architecture & Mathematical Models
@@ -112,11 +112,20 @@ This repository contains two exhaustive engineering manuals for building and deb
    * Clarifications on INA219 Register Defaults, Holding Torque & Integer Promotion
    * 51-Point Component-by-Component Bench Assembly & Connection Verification Checklist
 
-3. 💻 **[Production Firmware Source Code](Core/)**
-   * Production-grade, modular STM32 HAL C codebase (`Core/Inc`, `Core/Src`)
-   * Fully implemented SSD1306 OLED font and real-time dashboard rendering engine
-   * Hardware DWT cycle counter microsecond delay for 20 ms / 50 Hz mains-hum rejection
+3. 🛠️ **[Corrected Design Notes & Hardware Fixes (Rev 2)](FIXES.md)**
+   * Power path dead short fixes, schematic verdicts, and diode / TVS sizing
+   * Safe 12-step bring-up order with per-step pass/fail criteria
+   * Firmware revisions: runaway detector, headless I²C tracking, sun search & flash calibration
+
+4. 💻 **[Production Firmware Source Code](Core/)**
+   * Production-grade STM32 HAL C codebase (`Core/Src/main.c`, `Core/Inc/`)
+   * Fully implemented SSD1306 OLED framebuffer & 8-line live dashboard
+   * Hardware DWT cycle counter delay for 20 ms / 50 Hz mains-hum rejection
    * Boot-time I²C scanner, staggered servo soft-start, runaway protection, and dawn acquisition sweep
+
+5. 🧪 **[Host Unit Testing Suite](tests/)**
+   * 37-check PC host test suite running against a mock HAL
+   * Validates INA219 telemetry math, axis controller, runaway detector, night park, and dashboard formatting
 
 ---
 
