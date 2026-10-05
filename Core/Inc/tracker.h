@@ -1,7 +1,8 @@
 /**
   ******************************************************************************
   * @file           : tracker.h
-  * @brief          : Dual-axis solar tracking algorithms and servo actuation.
+  * @brief          : Single-axis (Azimuth) solar tracking algorithms and servo actuation.
+  *                   Hardware: 2x GL5528 LDR (Left=PA0, Right=PA1), 1x MG90S Servo (PA6)
   ******************************************************************************
   */
 
@@ -15,15 +16,12 @@ extern "C" {
 #include "stm32f1xx_hal.h"
 #include "main.h"
 
-/* Direction signs: +1 or -1 */
+/* Direction sign: +1 or -1. Flip to -1 if servo runs away from the light. */
 #define PAN_DIR                 (+1)
-#define TILT_DIR                (+1)
 
-/* Pulse limits (microseconds) avoiding mechanical binding */
+/* Pulse limits (microseconds) — avoids mechanical binding */
 #define PAN_MIN_PULSE           750
 #define PAN_MAX_PULSE           2250
-#define TILT_MIN_PULSE          850
-#define TILT_MAX_PULSE          2150
 #define SERVO_CENTER_PULSE      1500
 
 /* Tracking Control Parameters */
@@ -31,9 +29,9 @@ extern "C" {
 #define STEP_TICKS              15      // ~1.5 degree increment per move
 #define MAX_RUNAWAY_STEPS       5       // Consecutive non-reducing error steps before trip
 
-/* Night Parking & Dawn Recovery (Sum of 4 ADC Channels, range 0-16380) */
-#define NIGHT_ENTER_ADC_SUM     800     // Average <200 counts per LDR -> Night Park
-#define NIGHT_EXIT_ADC_SUM      1500    // Average >375 counts per LDR -> Resume Tracking
+/* Night Parking & Dawn Recovery (Sum of 2 ADC Channels, range 0-8190) */
+#define NIGHT_ENTER_ADC_SUM     400     // Average <200 counts per LDR -> Night Park
+#define NIGHT_EXIT_ADC_SUM      750     // Average >375 counts per LDR -> Resume Tracking
 
 /* API */
 void Tracker_Init(TIM_HandleTypeDef *htim, ADC_HandleTypeDef *hadc);

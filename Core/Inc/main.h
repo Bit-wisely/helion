@@ -3,6 +3,7 @@
   * @file           : main.h
   * @brief          : Header for main.c file.
   *                   Target: STM32F103C8T6 @ 72 MHz
+  *                   Single-axis azimuth tracker — 2x LDR (PA0, PA1), 1x Servo (PA6)
   ******************************************************************************
   */
 
@@ -41,7 +42,6 @@ typedef struct {
     float mah_tracked;  // Accumulated mAh
     float mah_fixed;    // Accumulated mAh
     int32_t err_pan;    // Normalized Azimuth error (-100% to +100%)
-    int32_t err_tilt;   // Normalized Elevation error (-100% to +100%)
     bool is_parked;     // True if night-parked or low light
     TrackerMode mode;   // Active mode
 } SystemTelemetry;
@@ -52,10 +52,9 @@ typedef struct {
 #define BTN_PIN                 GPIO_PIN_4
 #define BTN_GPIO_PORT           GPIOA
 
+/* Single-axis: only pan servo on PA6 (TIM3 CH1) */
 #define PAN_SERVO_PIN           GPIO_PIN_6
 #define PAN_SERVO_PORT          GPIOA
-#define TILT_SERVO_PIN          GPIO_PIN_7
-#define TILT_SERVO_PORT         GPIOA
 
 #define I2C_SCL_PIN             GPIO_PIN_6
 #define I2C_SDA_PIN             GPIO_PIN_7
