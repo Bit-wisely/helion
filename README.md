@@ -9,13 +9,11 @@
 
 ---
 
-## 📸 System Overview & Hardware Reference
+## 📸 Complete Wiring Guide
 
-![Complete System Wiring Overview](images/system_wiring_overview.jpg)
+The diagram below is a **wire-by-wire connection reference** — accurate enough to build from directly. Color code: 🔴 Red = 5V, 🟠 Orange = 3.3V, ⚫ Black = GND, 🟡 Yellow = Signal, 🔵 Blue = I2C SCL, 🟢 Green = I2C SDA.
 
-> [!CAUTION]
-> **SCHEMATIC CAUTION — DO NOT WIRE DIRECTLY FROM THE OVERVIEW DRAWING:**
-> Always follow the written specifications, the pin mapping table below, and the audit report for verified wiring. The schematic image is for orientation only.
+![Complete Wiring Guide — Wire every component from this diagram](images/complete_wiring_guide.jpg)
 
 ### Core Capabilities
 * **Active Single-Axis Tracking:** East–West Pan (Azimuth) controlled by a metal-gear MG90S servo with continuous pulse-gated holding torque against wind gusts.
