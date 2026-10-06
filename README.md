@@ -3,7 +3,7 @@
 [![STM32](https://img.shields.io/badge/Microcontroller-STM32F103C8T6-blue.svg)](https://www.st.com/en/microcontrollers-microprocessors/stm32f103c8.html)
 [![Sensors](https://img.shields.io/badge/Sensors-3x%20INA219%20%7C%202x%20GL5528%20LDR-orange.svg)]()
 [![Actuators](https://img.shields.io/badge/Actuators-1x%20MG90S%20Servo-green.svg)]()
-[![Status](https://img.shields.io/badge/Status-Hardware%20Audited%20%26%20Verified-brightgreen.svg)]()
+[![Status](https://img.shields.io/badge/Firmware-Host%20Tested%2C%20Not%20Yet%20Bench%20Verified-yellow.svg)]()
 
 **Helion** is an autonomous electro-mechanical **single-axis (azimuth) solar tracker** and multi-channel telemetry platform. It keeps a photovoltaic (PV) solar panel oriented perpendicular to incoming solar rays along the east–west axis while simultaneously recording **tracked energy generation**, **baseline static panel yield**, and **parasitic system power consumption**.
 
@@ -40,11 +40,12 @@ The diagram below is a **wire-by-wire connection reference** — accurate enough
 | **9 V 2 A DC Power Adapter** | 1 | 1 | Main system wall supply (5.5×2.1 mm center-positive) |
 | **DC Barrel Jack (Female)** | 1 | 1 | Chassis socket with positive-line series slide switch & 2A fuse |
 | **3 A Schottky Diode (SS34 / 1N5822)** | 1 | 3 | Reverse-polarity protection (3 A rated) |
-| **5.6 V TVS Diode (1.5KE5.6A / SMBJ5.0A)**| 1 | 2 | Overvoltage clamp across 5V rail against buck regulator failure |
+| **SMBJ5.0A TVS Diode** | 1 | 2 | Overvoltage clamp across 5V rail against buck regulator failure (avoid 1.5KE5.6A: it leaks at 5.1 V) |
 | **2 A Fuse (Glass/PPTC)** | 1 | 2 | Overcurrent protection against motor stalls |
 | **Tactile Pushbutton** | 1 | 2 | PA4 user interface (Short = Mode Toggle, Long = Calibrate) |
 | **3.3 kΩ – 4.7 kΩ Resistors** | 2 | 10 | LDR voltage dividers — one per LDR sensor (Left & Right) |
 | **10 kΩ Resistor** | 1 | 5 | External servo signal pull-down (PA6) |
+| **330 Ω Resistor** | 1 | 5 | Series resistor in the servo signal line (PA6) |
 | **1000 µF 16V Electrolytic Cap** | 1 | 2 | Low-ESR inrush reservoir across 5V servo rail |
 
 ---
@@ -58,7 +59,7 @@ The diagram below is a **wire-by-wire connection reference** — accurate enough
 | **`PA2`** | *Not Used* | — | Leave unconnected (formerly Bottom-Left LDR) |
 | **`PA3`** | *Not Used* | — | Leave unconnected (formerly Bottom-Right LDR) |
 | **`PA4`** | `GPIO_Input` | Mode / Calibrate Button | Active-low pushbutton to GND (Internal pull-up) |
-| **`PA6`** | `TIM3_CH1` | **Pan (Azimuth) Servo PWM** | External $10\text{ k}\Omega$ pull-down to GND required |
+| **`PA6`** | `TIM3_CH1` | **Pan (Azimuth) Servo PWM** | 330 Ω series resistor; external $10\text{ k}\Omega$ pull-down to GND required |
 | **`PA7`** | *Not Used* | — | Leave unconnected (formerly Tilt Servo) |
 | **`PB6`** | `I2C1_SCL` | Shared I²C SCL Bus Line | OLED (`0x3C`) + INA219s (`0x40`, `0x41`, `0x44`) |
 | **`PB7`** | `I2C1_SDA` | Shared I²C SDA Bus Line | Shared 3.3 V I²C data line |
@@ -102,7 +103,7 @@ For a single-axis azimuth tracker, the two LDRs must be mounted with a **vertica
 | **MG90S Servo** | ![MG90S Servo](images/mg90s_servo.jpg) | Metal-gear micro servo. Orange = Signal (PA6), Red = 5V Rail, Brown = GND. **Single servo only.** |
 | **LM2596 Buck Converter** | ![LM2596 Converter](images/lm2596_module.jpg) | Multi-turn trimmer adjusts 7-12V input down to regulated 5.00 V system power. |
 | **SSD1306 OLED** | ![SSD1306 Display](images/ssd1306_oled.jpg) | 128×64 pixel display on I²C address `0x3C`. Powered from 3.3 V rail. |
-| **Protection Hardware** | ![Protection Components](images/protection_components.jpg) | 1N5819 Schottky diode + 2A glass fuse + DC barrel jack socket. |
+| **Protection Hardware** | ![Protection Components](images/protection_components.jpg) | Schottky diode + 2A glass fuse + DC barrel jack socket. Photo shows a 1N5819 (1 A) – fit a 3 A part (SS34 / 1N5822). |
 
 ---
 
@@ -132,19 +133,19 @@ This repository contains exhaustive engineering documentation, design reviews, f
 2. 🔍 **[Hardware Audit & Wiring Verification Report](hardware_audit_report.md)**
    * Component-by-Component Bench Assembly & Connection Verification Checklist
 
-3. 🛠️ **[Corrected Design Notes & Hardware Fixes (Rev 3)](FIXES.md)**
-   * Single-axis redesign change log
-   * Safe bring-up order with per-step pass/fail criteria
+3. 🛠️ **[Design Notes, Project Setup & Bring-up (Rev 3)](FIXES.md)**
+   * Which drawings to trust, corrected power path, real-world hardware issues
+   * STM32CubeIDE setup, tuning table, safe bring-up order with pass/fail criteria
 
-4. 💻 **[Production Firmware Source Code](Core/)**
-   * Production-grade STM32 HAL C codebase (`Core/Src/main.c`, `Core/Inc/`)
-   * SSD1306 OLED framebuffer & 8-line live dashboard
-   * DWT cycle counter delay for 20 ms / 50 Hz mains-hum rejection
-   * Boot-time I²C scanner, servo soft-start, runaway protection, dawn sweep
+4. 💻 **[Firmware Source Code](Core/)**
+   * `Core/Src/main.c` – complete single-axis firmware (tracking, INA219 telemetry, SSD1306 dashboard, flash calibration)
+   * `Core/Inc/main.h`, `Core/Src/stm32f1xx_it.c` – header and exception handlers
+   * DWT cycle-counter timing, 20 ms mains-hum rejection, runaway / open-LDR detection, sun search, watchdog
 
 5. 🧪 **[Host Unit Testing Suite](tests/)**
-   * PC host test suite running against a mock HAL
-   * Validates INA219 telemetry math, azimuth controller, runaway detector, and dashboard
+   * PC test suite running `main.c` against a fake HAL (INA219 maths, azimuth controller, calibration flash round-trip, night logic, dashboard)
+
+> The two long documents above (`solar_tracker_hardware_manual.md`, `hardware_audit_report.md`) were written for the earlier **dual-axis** design (4 LDRs, 2 servos). Where they disagree with this README, `FIXES.md` or `Core/`, the latter win.
 
 ---
 
@@ -152,14 +153,14 @@ This repository contains exhaustive engineering documentation, design reviews, f
 
 1. **Continuity & Short Check:** With power OFF, verify with a multimeter that `5V`, `3.3V`, and `GND` are completely isolated from each other.
 2. **Trim Power Output:** Connect 9 V supply to LM2596 input with nothing attached to output. Measure with DMM. Adjust trimmer until reading exactly **$5.00\text{ V} \pm 0.05\text{ V}$**.
-3. **Flash MCU:** Connect ST-Link V2 using `SWDIO`, `SWCLK`, `GND`, and `NRST`. *Do NOT connect the ST-Link 3.3V wire when powered via LM2596.* Flash the firmware from `Core/`.
+3. **Flash MCU:** Connect ST-Link V2 using `SWDIO`, `SWCLK`, `GND`, and `NRST`. *Do NOT connect the ST-Link 3.3V wire when powered via LM2596.* Create the CubeIDE project and flash the firmware as described in [FIXES.md §4.2](FIXES.md).
 4. **Set I²C Addresses:**
    * INA219 #1 (Tracked Panel): Leave A0 & A1 open (`0x40`)
    * INA219 #2 (System Power): Bridge **A0** (`0x41`)
    * INA219 #3 (Fixed Panel): Bridge **A1** (`0x44`)
-5. **Verify I²C Bus Scan:** Confirm all 4 devices (`0x3C`, `0x40`, `0x41`, `0x44`) are detected on startup.
+5. **Verify I²C devices:** The boot screen must show `OLED:OK INA1:OK INA2:OK INA3:OK` (`0x3C`, `0x40`, `0x41`, `0x44`).
 6. **Connect Servo Last:** Power servo via a current-limited bench supply set to 1 A initially to verify smooth initialization.
-7. **Calibrate Sensors:** Hold button on `PA4` for >2s under **uniform lighting** (point both LDRs at an even sky/lamp) to store relative LDR offset calibration factors.
+7. **Calibrate Sensors:** Hold button on `PA4` for >2s under **uniform lighting** (point both LDRs at an even sky/lamp) to store the relative LDR gains in flash. Short press = Demo ⇄ Field mode.
 
 ---
 

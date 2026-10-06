@@ -238,6 +238,8 @@ typedef struct {
 #define __HAL_RCC_GET_FLAG(f)          (0)
 #define __HAL_RCC_CLEAR_RESET_FLAGS()  ((void)0)
 #define __disable_irq()                ((void)0)
+static inline void NVIC_SystemReset(void) { }
+#define __HAL_TIM_ENABLE_OCxPRELOAD(h, ch) ((void)0)
 #define __enable_irq()                 ((void)0)
 
 extern uint32_t stub_cmp[2];

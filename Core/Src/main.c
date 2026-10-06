@@ -1,48 +1,32 @@
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   Helion single-axis solar tracker — firmware rev 3
-  * @target  STM32F103C8T6 "Blue Pill", HSE 8 MHz -> PLL -> 72 MHz, HAL F1
+  * @brief   Helion single-axis solar tracker firmware
+  * @target  STM32F103C8T6 "Blue Pill", HSE 8 MHz -> PLL -> 72 MHz, STM32 HAL (F1)
   *
-  *  Redesign (rev 3) — Dual-axis -> Single-axis:
-  *    - 4 LDRs -> 2 LDRs  (Left=PA0/CH0, Right=PA1/CH1)
-  *    - 2 Servos -> 1 Servo (Pan/Azimuth only, PA6/TIM3_CH1)
-  *    - Tilt axis, tilt error, TIM3 CH2, PA7 all removed
-  *    - Sun search is now a 1D azimuth sweep (no row grid)
-  *    - Cal flash packing updated to 2-channel (w1 only)
-  *    - Night thresholds re-based on sum of 2 ADC channels
-  *    - OLED dashboard: EL line removed, AZ single reading shown
+  *  Hardware
+  *    PA0  ADC1_IN0   Left  LDR divider      PA1  ADC1_IN1   Right LDR divider
+  *    PA4  Button to GND (internal pull-up)  PA6  TIM3_CH1   Pan servo (50 Hz PWM)
+  *    PB6  I2C1_SCL / PB7 I2C1_SDA           PC13 Status LED (active low)
+  *    I2C devices: OLED 0x3C, INA219 0x40 (tracked panel), 0x41 (system input),
+  *                 0x44 (fixed reference panel)
   *
-  *  Fixes carried forward from rev 2:
-  *    - Audit 1  : system INA219 read no longer aliases three fields.
-  *    - Audit 2  : HAL MSP callbacks added (clocks + pin modes for ADC/TIM/I2C).
-  *    - Audit 3  : Error_Handler() added.
-  *    - Audit 4  : real OLED framebuffer + 5x7 text + 8-line live dashboard.
-  *    - Audit 7  : DWT cycle-counter timing instead of a spin-loop.
-  *    - Audit 8  : thresholds renamed *_ADC_SUM, re-based, with confirm counters.
-  *    - Audit 9  : servo release/hold is explicit and configurable.
-  *    - Audit 11 : button is a non-blocking debounced state machine.
-  *    - Audit 15 : calibration is stored in the last flash page.
-  *    - Audit 16 : telemetry timer initialised before the loop.
-  *    - Audit 19 : IWDG watchdog (4 s) + reset-cause detection.
-  *    - Audit 22 : I2C bus clear + peripheral reset + re-init on failure.
+  *  Behaviour
+  *    - Tracking is independent of I2C: a dead telemetry bus never stops the servo.
+  *    - Boot: centre servo -> if dark, park; otherwise sweep to find the sun.
+  *    - Faults (fast LED blink, servo holds position, short press clears):
+  *        runaway : servo keeps moving without the error shrinking
+  *                  (wrong PAN_DIR, slipped horn, blocked panel)
+  *        LDR     : one channel ~0 while the other is lit (open wire / bad divider)
+  *    - Calibration (hold button > 2 s under uniform light) is stored in flash.
+  *    - 4 s independent watchdog; a watchdog reset is reported on the boot screen.
+  *    - Telemetry maths is integer-only (no float printf needed).
   *
-  *  New protections (rev 2, retained):
-  *    - Per-axis runaway detector (catches wrong PAN_DIR, stuck gear).
-  *    - Open/shorted LDR detector (holds position instead of chasing noise).
-  *    - Calibration sanity checks (rejects dark/saturated/unequal lighting).
-  *    - Sun search sweep at boot and at dawn (baffle FOV is narrow).
-  *    - Tracking never depends on I2C: a dead sensor bus cannot stop tracker.
-  *    - Integer-only telemetry maths (works with newlib-nano, no %f needed).
-  *
-  *  Pin map (rev 3):
-  *    PA0       ADC LDR Left        PA1       ADC LDR Right
-  *    PA4       Button (to GND)     PA6       TIM3 CH1 Pan Servo
-  *    PB6 SCL / PB7 SDA             PC13      LED (active-low)
+  *  Button: short press = DEMO <-> FIELD (and clears faults), hold > 2 s = calibrate
+  *  LED   : heartbeat = OK, double blink = I2C device missing,
+  *          fast blink = fault, rare blip = parked
   ******************************************************************************
   */
-/* USER CODE END Header */
 
 #include "main.h"
 #include <stdint.h>
@@ -50,6 +34,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+
+typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 
 /* ========================================================================== */
 /*  Build-time configuration                                                   */
@@ -65,7 +51,12 @@
 #define PAN_MIN_PULSE           900
 #define PAN_MAX_PULSE           2100
 #define PAN_CENTER_PULSE        1500
-#define PARK_PAN_PULSE          2000    /* facing east for sunrise            */
+/* 1 = stop PWM after parking (saves ~10 mA, panel is free to move in wind at
+ * night). 0 = keep holding the park position (default, safer for the gears). */
+#define PARK_RELEASE_SERVO      0
+#define PARK_PAN_PULSE          2000    /* night rest position: aim at where the
+                                         * sun rises. Higher pulse = towards the
+                                         * RIGHT LDR when PAN_DIR is +1.       */
 
 /* Tracking */
 #define DEADBAND                40      /* 40 = 4.0 % normalised difference   */
@@ -74,6 +65,9 @@
 #define STEP_DIV                20      /* step = MIN + |err|/DIV, clamped    */
 #define RUNAWAY_STEPS           40      /* same-direction steps w/o improvement */
 #define RUNAWAY_LIMIT_STEPS     12
+/* Mode after power-up / watchdog reset. Use MODE_FIELD for a permanent outdoor
+ * install so a power glitch does not leave the tracker in fast DEMO mode.    */
+#define BOOT_MODE               MODE_DEMO
 #define DEMO_INTERVAL_MS        300
 #define FIELD_INTERVAL_MS       30000UL
 #define FIELD_SETTLE_MS         400
@@ -120,7 +114,10 @@
 
 /* Flash: last 1 KB page of a 64 KB part */
 #define CAL_FLASH_ADDR          0x0800FC00UL
-#define CAL_MAGIC               0x48454C33UL   /* "HEL3" — rev 3 single-axis  */
+#define CAL_MAGIC               0x48454C33UL   /* "HEL3" record marker        */
+#ifndef CAL_WORD                                /* overridden by the host tests */
+#define CAL_WORD(i)     (((const volatile uint32_t *)CAL_FLASH_ADDR)[i])
+#endif
 #define CAL_Q_MIN               2048U          /* 0.5 in Q12 */
 #define CAL_Q_MAX               8192U          /* 2.0 in Q12 */
 
@@ -130,8 +127,6 @@
 /* ========================================================================== */
 /*  Types and globals                                                          */
 /* ========================================================================== */
-
-typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 
 typedef struct {
     uint8_t  addr7;
@@ -168,7 +163,7 @@ static uint32_t release_at = 0;
 /* Two calibration Q12 gains — one per LDR (Left, Right) */
 static uint32_t cal_q[2] = { 4096, 4096 };
 
-static TrackerMode mode = MODE_DEMO;
+static TrackerMode mode = BOOT_MODE;
 static bool     is_parked = false;
 static bool     searching = false;
 static bool     force_track = false;
@@ -178,7 +173,6 @@ static Axis_t   ax_pan;
 static int32_t  err_az = 0;
 static uint32_t last_sum = 0;
 
-static uint64_t charge_trk = 0, charge_fix = 0;   /* 0.1 mA * ms        */
 static uint64_t energy_trk = 0, energy_fix = 0;   /* mV * 0.1 mA * ms   */
 
 static char     ui_msg[22] = "";
@@ -501,10 +495,10 @@ static void Read_LDRs(uint16_t raw[2], uint32_t c[2], uint32_t rounds, uint32_t 
     for (int i = 0; i < 2; i++) { c[i] = Cal_Apply(raw[i], i); }
 }
 
-static uint32_t Read_Light_Sum_Fast(void)
+static uint32_t Read_Light_Sum(void)
 {
     uint16_t raw[2]; uint32_t c[2];
-    Read_LDRs(raw, c, 8, 200);
+    Read_LDRs(raw, c, LDR_ROUNDS, LDR_PERIOD_US);
     return c[0] + c[1];
 }
 
@@ -528,8 +522,7 @@ static void Cal_Defaults(void)
 
 static void Cal_Load(void)
 {
-    const uint32_t *p = (const uint32_t *)CAL_FLASH_ADDR;
-    uint32_t magic = p[0], w1 = p[1], chk = p[2];
+    uint32_t magic = CAL_WORD(0), w1 = CAL_WORD(1), chk = CAL_WORD(2);
     /* Pack: w1 low 16 = cal_q[0], w1 high 16 = cal_q[1] */
     bool ok = (magic == CAL_MAGIC) && (chk == (magic ^ w1 ^ 0xA5A5A5A5UL));
     uint32_t q[2] = { w1 & 0xFFFFU, w1 >> 16 };
@@ -565,8 +558,7 @@ static bool Cal_Save(void)
     HAL_IWDG_Refresh(&hiwdg);
 
     if (ok) {
-        const uint32_t *pv = (const uint32_t *)CAL_FLASH_ADDR;
-        for (int i = 0; i < 3; i++) { if (pv[i] != words[i]) { ok = false; } }
+        for (int i = 0; i < 3; i++) { if (CAL_WORD(i) != words[i]) { ok = false; } }
     }
     return ok;
 }
@@ -713,7 +705,7 @@ static void Run_Sun_Search(void)
     for (uint16_t p = PAN_MIN_PULSE; p <= PAN_MAX_PULSE; p = (uint16_t)(p + SEARCH_PAN_STEP_US)) {
         Servo_Move(p, 0, false);
         Delay_ms(SEARCH_SETTLE_MS);
-        uint32_t s = Read_Light_Sum_Fast();
+        uint32_t s = Read_Light_Sum();
         if (s > best) { best = s; best_pan = p; }
     }
 
@@ -728,7 +720,7 @@ static void Run_Sun_Search(void)
 
 static void Park(void)
 {
-    Servo_Move(PARK_PAN_PULSE, 1000, true);   /* release after 1 s */
+    Servo_Move(PARK_PAN_PULSE, 1000, PARK_RELEASE_SERVO);
     is_parked = true;
     night_cnt = 0; day_cnt = 0;
     Reset_Axes();
@@ -789,11 +781,9 @@ static void Telemetry_Task(uint32_t dt_ms)
     if (dt_ms > 5000U) { dt_ms = 5000U; }
 
     if (ina_trk.online) {
-        charge_trk += (uint64_t)(uint32_t)ina_trk.ma10 * dt_ms;
         energy_trk += (uint64_t)ina_trk.mv * (uint32_t)ina_trk.ma10 * dt_ms;
     }
     if (ina_fix.online) {
-        charge_fix += (uint64_t)(uint32_t)ina_fix.ma10 * dt_ms;
         energy_fix += (uint64_t)ina_fix.mv * (uint32_t)ina_fix.ma10 * dt_ms;
     }
 }
@@ -902,13 +892,13 @@ static void Display_Task(uint32_t now, bool force)
     OLED_Print(6, l);
 
     /* Line 7: Single-axis azimuth error + fault state */
-    if (now < ui_msg_until) {
+    if ((int32_t)(ui_msg_until - now) > 0) {
         snprintf(l, sizeof(l), "%s", ui_msg);
     } else {
         const char *f = (faults & FAULT_LDR)         ? "LDR!" :
                         (faults & FAULT_PAN_RUNAWAY)  ? "PAN!" :
                         ax_pan.at_limit               ? "LIMIT" : "OK";
-        snprintf(l, sizeof(l), "AZ%+04ld  SUM%lu  %s",
+        snprintf(l, sizeof(l), "AZ%+04ld S%lu %s",
                  (long)err_az, (unsigned long)last_sum, f);
     }
     OLED_Print(7, l);
@@ -1043,6 +1033,8 @@ static void MX_TIM3_Init(void)
     oc.OCFastMode = TIM_OCFAST_DISABLE;
     /* PA6 — single pan servo */
     if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
+    /* New pulse width takes effect at the next frame: no runt pulse mid-period */
+    __HAL_TIM_ENABLE_OCxPRELOAD(&htim3, TIM_CHANNEL_1);
 }
 
 /* ---- MSP callbacks ---- */
@@ -1123,13 +1115,21 @@ void SystemClock_Config(void)
     if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK) { Error_Handler(); }
 }
 
+/* Init failure (e.g. HSE did not start). Blink PC13 for a few seconds so the
+ * fault is visible, then reset and try again: an unattended unit must not
+ * sit dead after a transient start-up problem. */
 void Error_Handler(void)
 {
+    GPIO_InitTypeDef g = {0};
     __disable_irq();
-    for (;;) {
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    g.Pin = GPIO_PIN_13; g.Mode = GPIO_MODE_OUTPUT_PP; g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOC, &g);
+    for (int i = 0; i < 40; i++) {
         HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        for (volatile uint32_t i = 0; i < 400000UL; i++) { }
+        for (volatile uint32_t d = 0; d < 400000UL; d++) { }
     }
+    NVIC_SystemReset();
 }
 
 /* ========================================================================== */
@@ -1151,6 +1151,7 @@ int main(void)
     HAL_ADCEx_Calibration_Start(&hadc1);
     Cal_Load();
 
+    HAL_Delay(100);                 /* let OLED / INA219 finish power-up */
     I2C_BusClear();
     MX_I2C1_Init();
 
@@ -1164,7 +1165,7 @@ int main(void)
         char l[48];
         OLED_Clear();
         OLED_Print(0, "HELION SOLAR TRACKER");
-        OLED_Print(1, "SINGLE AXIS REV3");
+        OLED_Print(1, "SINGLE AXIS");
         snprintf(l, sizeof(l), "OLED:OK  INA1:%s", ina_trk.online ? "OK" : "--");
         OLED_Print(3, l);
         snprintf(l, sizeof(l), "INA2:%s  INA3:%s",

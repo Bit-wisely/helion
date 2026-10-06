@@ -15,3 +15,5 @@ Release/
 *.tmp
 *~
 .DS_Store
+
+tests/test

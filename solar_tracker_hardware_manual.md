@@ -1,5 +1,8 @@
 # Dual-Axis Solar Tracker: Complete Hardware Engineering Manual & Implementation Guide
 
+> **Note:** this document was written for the earlier **dual-axis** design (4 LDRs, 2 servos, tilt axis) and some firmware excerpts in it are obsolete. The current design is single-axis; see `README.md`, `FIXES.md` and `Core/` for the authoritative description.
+
+
 ---
 
 ## 1. System Architecture & High-Level Block Diagram

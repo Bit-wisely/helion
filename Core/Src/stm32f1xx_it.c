@@ -1,45 +1,25 @@
 /**
   ******************************************************************************
   * @file    stm32f1xx_it.c
-  * @brief   Interrupt Service Routines.
+  * @brief   Cortex-M3 exception handlers.
   ******************************************************************************
   */
 
 #include "main.h"
 
-/******************************************************************************/
-/*            Cortex-M3 Processor Exceptions Handlers                         */
-/******************************************************************************/
+/* Any fatal CPU fault: reset immediately. An unattended tracker must restart
+ * and carry on rather than hang with the servo unpowered or mis-pointed. */
+void NMI_Handler(void)        { NVIC_SystemReset(); }
+void HardFault_Handler(void)  { NVIC_SystemReset(); }
+void MemManage_Handler(void)  { NVIC_SystemReset(); }
+void BusFault_Handler(void)   { NVIC_SystemReset(); }
+void UsageFault_Handler(void) { NVIC_SystemReset(); }
 
-void NMI_Handler(void) {
-    while (1) {}
-}
+void SVC_Handler(void)        { }
+void DebugMon_Handler(void)   { }
+void PendSV_Handler(void)     { }
 
-void HardFault_Handler(void) {
-    while (1) {
-        HAL_GPIO_TogglePin(LED_GPIO_PORT, LED_PIN);
-        for (volatile uint32_t i = 0; i < 200000; i++);
-    }
-}
-
-void MemManage_Handler(void) {
-    while (1) {}
-}
-
-void BusFault_Handler(void) {
-    while (1) {}
-}
-
-void UsageFault_Handler(void) {
-    while (1) {}
-}
-
-void SVC_Handler(void) {}
-
-void DebugMon_Handler(void) {}
-
-void PendSV_Handler(void) {}
-
-void SysTick_Handler(void) {
+void SysTick_Handler(void)
+{
     HAL_IncTick();
 }
