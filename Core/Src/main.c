@@ -7,24 +7,24 @@
   *  Hardware
   *    PA0  ADC1_IN0   Left  LDR divider      PA1  ADC1_IN1   Right LDR divider
   *    PA4  Button to GND (internal pull-up)  PA6  TIM3_CH1   Pan servo (50 Hz PWM)
-  *    PB6  I2C1_SCL / PB7 I2C1_SDA           PC13 Status LED (active low)
-  *    I2C devices: OLED 0x3C, INA219 0x40 (tracked panel), 0x41 (system input),
+  *    PA9  USART1_TX (115200 8N1)            PA10 USART1_RX  (115200 8N1)
+  *    PB6  I2C1_SCL / PB7 I2C1_SDA
+  *    I2C devices: INA219 0x40 (tracked panel), 0x41 (system input),
   *                 0x44 (fixed reference panel)
   *
   *  Behaviour
   *    - Tracking is independent of I2C: a dead telemetry bus never stops the servo.
   *    - Boot: centre servo -> if dark, park; otherwise sweep to find the sun.
-  *    - Faults (fast LED blink, servo holds position, short press clears):
+  *    - Faults (servo holds position, short press clears):
   *        runaway : servo keeps moving without the error shrinking
   *                  (wrong PAN_DIR, slipped horn, blocked panel)
   *        LDR     : one channel ~0 while the other is lit (open wire / bad divider)
   *    - Calibration (hold button > 2 s under uniform light) is stored in flash.
-  *    - 4 s independent watchdog; a watchdog reset is reported on the boot screen.
+  *    - 4 s independent watchdog; a watchdog reset is reported over serial.
   *    - Telemetry maths is integer-only (no float printf needed).
   *
   *  Button: short press = DEMO <-> FIELD (and clears faults), hold > 2 s = calibrate
-  *  LED   : heartbeat = OK, double blink = I2C device missing,
-  *          fast blink = fault, rare blip = parked
+  *  Serial: 115200 8N1 periodic telemetry block (500 ms) to laptop
   ******************************************************************************
   */
 
@@ -97,7 +97,7 @@ typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 #define I2C_SPEED_HZ            100000
 
 /* Bring-up helper: 1 = firmware only sweeps the servo and shows the pulse
- * width on the OLED (press button to stop). Use it to find safe limits.      */
+ * width over serial (press button to stop). Use it to find safe limits.     */
 #define SERVO_SWEEP_TEST        0
 
 /* ========================================================================== */
@@ -107,7 +107,6 @@ typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 #define LDR_ROUNDS              40U
 #define LDR_PERIOD_US           (1000000UL / MAINS_HZ / LDR_ROUNDS)
 
-#define OLED_ADDR7              0x3C
 #define INA_TRK_ADDR7           0x40
 #define INA_SYS_ADDR7           0x41
 #define INA_FIX_ADDR7           0x44
@@ -147,12 +146,12 @@ typedef struct {
 ADC_HandleTypeDef  hadc1;
 I2C_HandleTypeDef  hi2c1;
 TIM_HandleTypeDef  htim3;
+UART_HandleTypeDef huart1;
 IWDG_HandleTypeDef hiwdg = { .Instance = IWDG };
 
 static Ina219_t ina_trk = { .addr7 = INA_TRK_ADDR7 };
 static Ina219_t ina_sys = { .addr7 = INA_SYS_ADDR7 };
 static Ina219_t ina_fix = { .addr7 = INA_FIX_ADDR7 };
-static bool     oled_online = false;
 
 /* Single-axis: only pan servo */
 static uint16_t pan_pulse  = PAN_CENTER_PULSE;
@@ -179,8 +178,6 @@ static char     ui_msg[22] = "";
 static uint32_t ui_msg_until = 0;
 static uint32_t last_i2c_recover = 0;
 static bool     boot_wdg_reset = false;
-
-static uint8_t  fb[8 * 128];   /* SSD1306 framebuffer */
 
 /* ========================================================================== */
 /*  Prototypes                                                                 */
@@ -222,24 +219,18 @@ static int32_t Clamp32(int32_t v, int32_t lo, int32_t hi)
     return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
+static void UART_SendString(const char *s)
+{
+    HAL_UART_Transmit(&huart1, (const uint8_t *)s, (uint16_t)strlen(s), 100);
+}
+
 static void Set_UI_Message(const char *msg, uint32_t duration_ms)
 {
     strncpy(ui_msg, msg, sizeof(ui_msg) - 1);
     ui_msg[sizeof(ui_msg) - 1] = '\0';
     ui_msg_until = HAL_GetTick() + duration_ms;
-}
-
-static void LED_Set(bool on)
-{
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, on ? GPIO_PIN_RESET : GPIO_PIN_SET);
-}
-
-static void LED_Blink(uint8_t count, uint32_t on_ms, uint32_t off_ms)
-{
-    for (uint8_t i = 0; i < count; i++) {
-        LED_Set(true);  Delay_ms(on_ms);
-        LED_Set(false); Delay_ms(off_ms);
-    }
+    UART_SendString(msg);
+    UART_SendString("\r\n");
 }
 
 /* ========================================================================== */
@@ -304,6 +295,7 @@ static void I2C_Recover(void)
 
 static bool I2C_Probe(uint8_t addr7)
 {
+    if (addr7 == 0x3C) { return false; }
     return HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr7 << 1), 2, 10) == HAL_OK;
 }
 
@@ -366,87 +358,6 @@ static void Ina_Poll(Ina219_t *d)
         Ina_Clear(d);
         I2C_Recover();
     }
-}
-
-/* ========================================================================== */
-/*  SSD1306 (framebuffer + 5x7 font)                                           */
-/* ========================================================================== */
-
-/* ASCII 0x20..0x5A (space..Z). Lower case is mapped to upper case. */
-static const uint8_t font5x7[59][5] = {
-    {0x00,0x00,0x00,0x00,0x00}, {0x00,0x00,0x5F,0x00,0x00}, {0x00,0x07,0x00,0x07,0x00}, {0x14,0x7F,0x14,0x7F,0x14},
-    {0x24,0x2A,0x7F,0x2A,0x12}, {0x23,0x13,0x08,0x64,0x62}, {0x36,0x49,0x56,0x20,0x50}, {0x00,0x08,0x07,0x03,0x00},
-    {0x00,0x1C,0x22,0x41,0x00}, {0x00,0x41,0x22,0x1C,0x00}, {0x2A,0x1C,0x7F,0x1C,0x2A}, {0x08,0x08,0x3E,0x08,0x08},
-    {0x00,0x80,0x70,0x30,0x00}, {0x08,0x08,0x08,0x08,0x08}, {0x00,0x00,0x60,0x60,0x00}, {0x20,0x10,0x08,0x04,0x02},
-    {0x3E,0x51,0x49,0x45,0x3E}, {0x00,0x42,0x7F,0x40,0x00}, {0x72,0x49,0x49,0x49,0x46}, {0x21,0x41,0x49,0x4D,0x33},
-    {0x18,0x14,0x12,0x7F,0x10}, {0x27,0x45,0x45,0x45,0x39}, {0x3C,0x4A,0x49,0x49,0x31}, {0x41,0x21,0x11,0x09,0x07},
-    {0x36,0x49,0x49,0x49,0x36}, {0x46,0x49,0x49,0x29,0x1E}, {0x00,0x00,0x14,0x00,0x00}, {0x00,0x40,0x34,0x00,0x00},
-    {0x00,0x08,0x14,0x22,0x41}, {0x14,0x14,0x14,0x14,0x14}, {0x00,0x41,0x22,0x14,0x08}, {0x02,0x01,0x59,0x09,0x06},
-    {0x3E,0x41,0x5D,0x59,0x4E}, {0x7C,0x12,0x11,0x12,0x7C}, {0x7F,0x49,0x49,0x49,0x36}, {0x3E,0x41,0x41,0x41,0x22},
-    {0x7F,0x41,0x41,0x41,0x3E}, {0x7F,0x49,0x49,0x49,0x41}, {0x7F,0x09,0x09,0x09,0x01}, {0x3E,0x41,0x41,0x51,0x73},
-    {0x7F,0x08,0x08,0x08,0x7F}, {0x00,0x41,0x7F,0x41,0x00}, {0x20,0x40,0x41,0x3F,0x01}, {0x7F,0x08,0x14,0x22,0x41},
-    {0x7F,0x40,0x40,0x40,0x40}, {0x7F,0x02,0x1C,0x02,0x7F}, {0x7F,0x04,0x08,0x10,0x7F}, {0x3E,0x41,0x41,0x41,0x3E},
-    {0x7F,0x09,0x09,0x09,0x06}, {0x3E,0x41,0x51,0x21,0x5E}, {0x7F,0x09,0x19,0x29,0x46}, {0x26,0x49,0x49,0x49,0x32},
-    {0x03,0x01,0x7F,0x01,0x03}, {0x3F,0x40,0x40,0x40,0x3F}, {0x1F,0x20,0x40,0x20,0x1F}, {0x3F,0x40,0x38,0x40,0x3F},
-    {0x63,0x14,0x08,0x14,0x63}, {0x03,0x04,0x78,0x04,0x03}, {0x61,0x59,0x49,0x4D,0x43}
-};
-
-static bool OLED_Cmd(uint8_t c)
-{
-    return HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(OLED_ADDR7 << 1), 0x00,
-                             I2C_MEMADD_SIZE_8BIT, &c, 1, 20) == HAL_OK;
-}
-
-static bool OLED_Init(void)
-{
-    static const uint8_t seq[] = {
-        0xAE, 0xD5,0x80, 0xA8,0x3F, 0xD3,0x00, 0x40, 0x8D,0x14,
-        0x20,0x00,                 /* horizontal addressing mode */
-        0xA1, 0xC8, 0xDA,0x12, 0x81,0xCF, 0xD9,0xF1, 0xDB,0x40,
-        0xA4, 0xA6, 0xAF
-    };
-    for (size_t i = 0; i < sizeof(seq); i++) {
-        if (!OLED_Cmd(seq[i])) { return false; }
-    }
-    return true;
-}
-
-static void OLED_Clear(void)
-{
-    memset(fb, 0, sizeof(fb));
-}
-
-static void OLED_Putc(uint8_t page, uint8_t x, char ch)
-{
-    int c = toupper((unsigned char)ch);
-    if (c < 0x20 || c > 0x5A) { c = '?'; }
-    const uint8_t *g = font5x7[c - 0x20];
-    uint8_t *p = &fb[page * 128 + x];
-    for (int i = 0; i < 5; i++) { p[i] = g[i]; }
-    p[5] = 0x00;
-}
-
-static void OLED_Print(uint8_t page, const char *s)
-{
-    if (page > 7) { return; }
-    uint8_t x = 0;
-    while (*s && x <= 122) {
-        OLED_Putc(page, x, *s++);
-        x += 6;
-    }
-}
-
-static bool OLED_Flush(void)
-{
-    if (!OLED_Cmd(0x21) || !OLED_Cmd(0x00) || !OLED_Cmd(0x7F)) { return false; }
-    if (!OLED_Cmd(0x22) || !OLED_Cmd(0x00) || !OLED_Cmd(0x07)) { return false; }
-    for (uint8_t page = 0; page < 8; page++) {
-        if (HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(OLED_ADDR7 << 1), 0x40,
-                              I2C_MEMADD_SIZE_8BIT, &fb[page * 128], 128, 50) != HAL_OK) {
-            return false;
-        }
-    }
-    return true;
 }
 
 /* ========================================================================== */
@@ -585,22 +496,18 @@ static void Calibrate_Sensor_Offsets(void)
     uint16_t raw[2];
     uint32_t q[2];
 
-    LED_Set(true);
     Sample_LDRs(raw, 400, 500);                 /* ~200 ms average */
     if (!Cal_Compute(raw, q)) {
         Set_UI_Message("CAL FAIL: LIGHT", 4000);
-        LED_Blink(6, 80, 80);
         return;
     }
     uint32_t old[2];
     for (int i = 0; i < 2; i++) { old[i] = cal_q[i]; cal_q[i] = q[i]; }
     if (Cal_Save()) {
         Set_UI_Message("CAL SAVED", 3000);
-        LED_Blink(2, 300, 300);
     } else {
         for (int i = 0; i < 2; i++) { cal_q[i] = old[i]; }
         Set_UI_Message("CAL FAIL: FLASH", 4000);
-        LED_Blink(6, 80, 80);
     }
 }
 
@@ -808,116 +715,61 @@ static void I2C_Maintenance(uint32_t now)
             list[i]->online = INA_Init(list[i]);
         }
     }
-    if (!oled_online && I2C_Probe(OLED_ADDR7)) { oled_online = OLED_Init(); }
 }
 
 static uint8_t Missing_Devices(void)
 {
-    return (uint8_t)(!ina_trk.online + !ina_sys.online + !ina_fix.online + !oled_online);
+    return (uint8_t)(!ina_trk.online + !ina_sys.online + !ina_fix.online);
 }
 
 /* ========================================================================== */
-/*  Dashboard                                                                  */
+/*  Dashboard (Laptop Serial Monitor over USART1 @ 115200 8N1)                 */
 /* ========================================================================== */
 
 static const char *Status_Text(void)
 {
-    if (faults)    { return "FAULT"; }
-    if (searching) { return "SEARCH"; }
-    if (is_parked) { return "PARK"; }
+    if (faults)            { return "FAULT"; }
+    if (searching)         { return "SEARCH"; }
+    if (is_parked)         { return "PARKED"; }
+    if (Missing_Devices()) { return "I2C MISSING"; }
     return "TRACK";
 }
 
 static void Display_Task(uint32_t now, bool force)
 {
     static uint32_t last = 0;
-    if (!oled_online) { return; }
-    if (!force && (now - last) < 1000U) { return; }
+    if (!force && (now - last) < 500U) { return; }
     last = now;
 
-    char l[48];
-    OLED_Clear();
-
-    /* Line 0: Header */
-    snprintf(l, sizeof(l), "HELION %s %s", (mode == MODE_DEMO) ? "DEMO" : "FIELD", Status_Text());
-    OLED_Print(0, l);
-
-    /* Line 1: Tracked panel V & I */
-    if (ina_trk.online)
-        snprintf(l, sizeof(l), "TRK %lu.%02luV %ld.%ldMA",
-                 (unsigned long)(ina_trk.mv / 1000),
-                 (unsigned long)((ina_trk.mv % 1000) / 10),
-                 (long)(ina_trk.ma10 / 10), (long)(ina_trk.ma10 % 10));
-    else snprintf(l, sizeof(l), "TRK --");
-    OLED_Print(1, l);
-
-    /* Line 2: Fixed reference panel V & I */
-    if (ina_fix.online)
-        snprintf(l, sizeof(l), "FIX %lu.%02luV %ld.%ldMA",
-                 (unsigned long)(ina_fix.mv / 1000),
-                 (unsigned long)((ina_fix.mv % 1000) / 10),
-                 (long)(ina_fix.ma10 / 10), (long)(ina_fix.ma10 % 10));
-    else snprintf(l, sizeof(l), "FIX --");
-    OLED_Print(2, l);
-
-    /* Line 3: Power comparison */
-    snprintf(l, sizeof(l), "PWR T%lu F%lu MW",
-             (unsigned long)ina_trk.mw, (unsigned long)ina_fix.mw);
-    OLED_Print(3, l);
-
-    /* Line 4: Tracking gain vs. fixed panel */
-    int32_t g;
-    if (Gain_Tenths(&g)) {
-        int32_t ag = (g < 0) ? -g : g;
-        snprintf(l, sizeof(l), "GAIN %c%ld.%ld PCT",
-                 (g < 0) ? '-' : '+', (long)(ag / 10), (long)(ag % 10));
-    } else {
-        snprintf(l, sizeof(l), "GAIN --");
-    }
-    OLED_Print(4, l);
-
-    /* Line 5: Accumulated energy */
+    char buf[256];
+    int32_t g = 0;
+    (void)Gain_Tenths(&g);
     unsigned long et = (unsigned long)(energy_trk / 3600000000ULL);
     unsigned long ef = (unsigned long)(energy_fix / 3600000000ULL);
-    snprintf(l, sizeof(l), "E T%lu.%lu F%lu.%lu MWH", et / 10, et % 10, ef / 10, ef % 10);
-    OLED_Print(5, l);
 
-    /* Line 6: System rail (INA219 #2) */
-    if (ina_sys.online)
-        snprintf(l, sizeof(l), "SYS %lu.%02luV %ld.%ldMA",
-                 (unsigned long)(ina_sys.mv / 1000),
-                 (unsigned long)((ina_sys.mv % 1000) / 10),
-                 (long)(ina_sys.ma10 / 10), (long)(ina_sys.ma10 % 10));
-    else snprintf(l, sizeof(l), "SYS --");
-    OLED_Print(6, l);
+    int len = snprintf(buf, sizeof(buf),
+        "HELION,mode=%s,st=%s,az=%+04ld,S=%lu\r\n"
+        "TRK,v_mV=%lu,i_mA=%ld,p_mW=%lu\r\n"
+        "FIX,v_mV=%lu,i_mA=%ld,p_mW=%lu\r\n"
+        "SYS,v_mV=%lu,i_mA=%ld\r\n"
+        "GAIN_x10=%+ld,E_T_x10=%lu,E_F_x10=%lu\r\n",
+        (mode == MODE_DEMO) ? "DEMO" : "FIELD",
+        Status_Text(),
+        (long)err_az,
+        (unsigned long)last_sum,
+        (unsigned long)ina_trk.mv,
+        (long)(ina_trk.ma10 / 10),
+        (unsigned long)ina_trk.mw,
+        (unsigned long)ina_fix.mv,
+        (long)(ina_fix.ma10 / 10),
+        (unsigned long)ina_fix.mw,
+        (unsigned long)ina_sys.mv,
+        (long)(ina_sys.ma10 / 10),
+        (long)g, et, ef);
 
-    /* Line 7: Single-axis azimuth error + fault state */
-    if ((int32_t)(ui_msg_until - now) > 0) {
-        snprintf(l, sizeof(l), "%s", ui_msg);
-    } else {
-        const char *f = (faults & FAULT_LDR)         ? "LDR!" :
-                        (faults & FAULT_PAN_RUNAWAY)  ? "PAN!" :
-                        ax_pan.at_limit               ? "LIMIT" : "OK";
-        snprintf(l, sizeof(l), "AZ%+04ld S%lu %s",
-                 (long)err_az, (unsigned long)last_sum, f);
+    if (len > 0) {
+        HAL_UART_Transmit(&huart1, (const uint8_t *)buf, (uint16_t)len, 100);
     }
-    OLED_Print(7, l);
-
-    if (!OLED_Flush()) {
-        oled_online = false;
-        I2C_Recover();
-    }
-}
-
-static void LED_Task(uint32_t now)
-{
-    bool on;
-    uint32_t t = now % 2000U;
-    if (faults)                { on = ((now / 125U) & 1U) != 0; }
-    else if (Missing_Devices()){ on = (t < 100U) || (t >= 300U && t < 400U); }
-    else if (is_parked)        { on = (now % 3000U) < 50U; }
-    else                       { on = t < 50U; }
-    LED_Set(on);
 }
 
 /* ========================================================================== */
@@ -968,12 +820,8 @@ static void Servo_Sweep_Test(void)
         for (int dir = 0; dir < 2; dir++) {
             uint16_t p = dir ? (uint16_t)(1500 + half) : (uint16_t)(1500 - half);
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, p);
-            OLED_Clear();
-            OLED_Print(0, "SERVO SWEEP TEST");
-            snprintf(l, sizeof(l), "PULSE %u US", (unsigned)p);
-            OLED_Print(3, l);
-            OLED_Print(6, "BUTTON = STOP");
-            (void)OLED_Flush();
+            snprintf(l, sizeof(l), "SWEEP,pulse_us=%u\r\n", (unsigned)p);
+            UART_SendString(l);
             for (int i = 0; i < 12; i++) {
                 Delay_ms(100);
                 if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET) {
@@ -994,12 +842,8 @@ static void MX_GPIO_Init(void)
     GPIO_InitTypeDef g = {0};
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    g.Pin = GPIO_PIN_13; g.Mode = GPIO_MODE_OUTPUT_PP; g.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &g);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
-
+    /* Mode / calibrate button on PA4 (internal pull-up) */
     g.Pin = GPIO_PIN_4; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &g);
 }
@@ -1035,6 +879,19 @@ static void MX_TIM3_Init(void)
     if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
     /* New pulse width takes effect at the next frame: no runt pulse mid-period */
     __HAL_TIM_ENABLE_OCxPRELOAD(&htim3, TIM_CHANNEL_1);
+}
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = 115200;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
 }
 
 /* ---- MSP callbacks ---- */
@@ -1085,6 +942,33 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef *h)
     if (h->Instance == I2C1) {
         __HAL_RCC_I2C1_CLK_DISABLE();
         HAL_GPIO_DeInit(GPIOB, GPIO_PIN_6 | GPIO_PIN_7);
+    }
+}
+
+void HAL_UART_MspInit(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        GPIO_InitTypeDef g = {0};
+        __HAL_RCC_USART1_CLK_ENABLE();
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+        /* PA9  -> USART1_TX */
+        g.Pin   = GPIO_PIN_9;
+        g.Mode  = GPIO_MODE_AF_PP;
+        g.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(GPIOA, &g);
+        /* PA10 -> USART1_RX */
+        g.Pin   = GPIO_PIN_10;
+        g.Mode  = GPIO_MODE_INPUT;
+        g.Pull  = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOA, &g);
+    }
+}
+
+void HAL_UART_MspDeInit(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        __HAL_RCC_USART1_CLK_DISABLE();
+        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_9 | GPIO_PIN_10);
     }
 }
 
@@ -1148,33 +1032,28 @@ int main(void)
     MX_GPIO_Init();
     MX_ADC1_Init();
     MX_TIM3_Init();
+    MX_USART1_UART_Init();
     HAL_ADCEx_Calibration_Start(&hadc1);
     Cal_Load();
 
-    HAL_Delay(100);                 /* let OLED / INA219 finish power-up */
+    HAL_Delay(100);                 /* let INA219 finish power-up */
     I2C_BusClear();
     MX_I2C1_Init();
 
-    oled_online = I2C_Probe(OLED_ADDR7) && OLED_Init();
     Ina219_t *list[3] = { &ina_trk, &ina_sys, &ina_fix };
     for (int i = 0; i < 3; i++) {
         list[i]->online = I2C_Probe(list[i]->addr7) && INA_Init(list[i]);
     }
 
-    if (oled_online) {
-        char l[48];
-        OLED_Clear();
-        OLED_Print(0, "HELION SOLAR TRACKER");
-        OLED_Print(1, "SINGLE AXIS");
-        snprintf(l, sizeof(l), "OLED:OK  INA1:%s", ina_trk.online ? "OK" : "--");
-        OLED_Print(3, l);
-        snprintf(l, sizeof(l), "INA2:%s  INA3:%s",
-                 ina_sys.online ? "OK" : "--", ina_fix.online ? "OK" : "--");
-        OLED_Print(4, l);
-        if (boot_wdg_reset) { OLED_Print(6, "LAST RESET: WATCHDOG"); }
-        (void)OLED_Flush();
-        Delay_ms(2000);
-    }
+    char boot_msg[64];
+    UART_SendString("HELION SOLAR TRACKER\r\nSINGLE AXIS\r\n");
+    snprintf(boot_msg, sizeof(boot_msg), "INA1:%s  INA2:%s  INA3:%s\r\n",
+             ina_trk.online ? "OK" : "--",
+             ina_sys.online ? "OK" : "--",
+             ina_fix.online ? "OK" : "--");
+    UART_SendString(boot_msg);
+    if (boot_wdg_reset) { UART_SendString("LAST RESET: WATCHDOG\r\n"); }
+    Delay_ms(2000);
 
 #if SERVO_SWEEP_TEST
     __HAL_DBGMCU_FREEZE_IWDG();
@@ -1224,7 +1103,6 @@ int main(void)
 
         I2C_Maintenance(now);
         Display_Task(now, false);
-        LED_Task(now);
     }
 }
 #endif /* HELION_UNIT_TEST */

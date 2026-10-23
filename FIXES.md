@@ -31,7 +31,7 @@ LM2596 OUT+ ─► 5 V BUS ─┬─► C1 1000 µF + 100 nF ─► GND
                         ├─► servo V+
                         └─► Blue Pill 5V pin
 
-Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 nF near the OLED)
+Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC   (+100 µF/100 nF near the INA219 cluster)
 ```
 
 | Net | Wiring |
@@ -39,7 +39,8 @@ Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 
 | LDR Left / Right | 3V3 → LDR → node; node → PA0 / PA1; node → 4.7 k → GND; node → 10 nF → GND |
 | Button | PA4 → button → GND (internal pull-up) |
 | Pan servo | PA6 → 330 Ω → servo signal; servo signal → 10 k → GND |
-| I²C | PB6 SCL / PB7 SDA → OLED + 3 INA219 |
+| UART | PA9 TX → Adapter RX ; PA10 RX ← Adapter TX (115200 8N1, 3.3 V logic) |
+| I²C | PB6 SCL / PB7 SDA → 3 INA219 (0x40, 0x41, 0x44). OLED removed |
 | Tracked / fixed panel | PV+ → INA219 VIN+ ; VIN− → 10 Ω 5 W → GND ; PV− → STAR GND |
 | SWD | ST-Link SWDIO, SWCLK, GND, **NRST** (never its 3.3 V while the board is externally powered) |
 
@@ -53,7 +54,7 @@ Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 
 | 4 | Switch in the ground leg. | Switch the **positive** leg only. |
 | 5 | USB and the `5V` header pin are the same net. | Program over SWD only, micro-USB unplugged. |
 | 6 | Stacked I²C pull-ups. | Power off, measure SDA→3V3: want 1.5 k – 10 k. Never add 4.7 k "just in case". |
-| 7 | 3.3 V LDO on clone boards is weak. | 100 µF + 100 nF near the OLED / INA219 cluster. |
+| 7 | 3.3 V LDO on clone boards is weak. | 100 µF + 100 nF near the INA219 cluster. |
 | 8 | Servo signal ringing / cross-coupling. | 330 Ω series + 10 k pull-down on PA6. |
 | 9 | No hardware reset from the programmer. | Wire ST-Link **NRST** to the Blue Pill `R` pin ("connect under reset"). |
 | 10 | Load resistors dissipate ≈ 2.7 W each on 5 W parts; heat skews the benchmark and softens PLA. | Metal standoffs, away from the panels and printed parts. |
@@ -63,36 +64,36 @@ Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 
 | 14 | Cables across the pan axis wear out. | Service loop; keep travel within what the cable allows. |
 | 15 | Moisture, UV, wind. | Enclosure, conformal coat, PETG/ASA instead of PLA. |
 | 16 | Full-sun LDR dividers sit near 3.2 V (≈ 3970 counts). | 4.7 k keeps both indoor and full-sun readings inside the ADC range. Do not go above ~10 k. |
-| 17 | The OLED is unreadable and ages when it runs 24/7 outdoors. | Cosmetic only – tracking and logging do not depend on it. |
+| 17 | On-board display / LED in outdoor conditions. | Removed OLED and PC13 status LED; telemetry streamed to laptop serial monitor over USART1 (PA9/PA10 @ 115200). |
 
 ## 4. Firmware
 
 ### 4.1 Behaviour
 
-* **Tracking never depends on I²C.** A dead telemetry bus shows `--` on the OLED and the firmware
+* **Tracking never depends on I²C.** A dead telemetry bus shows `--` over serial and the firmware
   re-probes missing devices every 5 s.
 * **Boot:** 100 ms power-up settle → centre servo → if dark, park; otherwise sweep the whole pan range
   and move to the brightest position. The same sweep runs at dawn.
 * **Controller:** step = 5 µs + |error|/20 (max 30 µs), 4 % deadband. Demo mode ticks every 300 ms, field
   mode every 30 s.
-* **Faults** (fast LED blink, servo holds, short press clears): *runaway* = 40 same-direction steps with no
+* **Faults** (servo holds, short press clears): *runaway* = 40 same-direction steps with no
   improvement (wrong `PAN_DIR`, slipped horn, blocked panel); *LDR* = one channel ≈ 0 while the other is lit
   (self-clears). Hitting the end of travel while the error was still improving is shown as `LIMIT`, not a fault.
 * **Calibration** (hold button > 2 s under uniform light): rejects dark, saturated or very unequal light,
   then saves the two gains to the last flash page.
-* **Watchdog** 4 s; a watchdog reset is shown at boot. Fatal CPU faults reset immediately; a failed
-  clock/peripheral init blinks the LED for a few seconds and resets.
-* **LED (PC13):** heartbeat = OK · double blink = I²C device missing · fast blink = fault · rare blip = parked.
+* **Watchdog** 4 s; a watchdog reset is reported over serial at boot. Fatal CPU faults reset immediately.
+* **Serial Telemetry (PA9/PA10 @ 115200 8N1):** Streams 5-line telemetry blocks every 500 ms to the laptop.
+  Status states (`TRACK`, `PARKED`, `I2C MISSING`, `FAULT`, `SEARCH`) are included in the header line.
 
 ### 4.2 Project setup (STM32CubeIDE, F1 HAL)
 
 1. New project for **STM32F103C8Tx**, clock = HSE crystal, debug = Serial Wire, **no peripherals enabled**
-   in the `.ioc`. `main.c` creates ADC1, TIM3, I²C1, GPIO and IWDG and contains its own `HAL_*_MspInit`
+   in the `.ioc`. `main.c` creates ADC1, TIM3, USART1, I²C1, GPIO and IWDG and contains its own `HAL_*_MspInit`
    callbacks. If you enable peripherals in CubeMX, delete the duplicates from the generated
    `stm32f1xx_hal_msp.c`.
 2. Copy `Core/Src/main.c`, `Core/Src/stm32f1xx_it.c` and `Core/Inc/main.h` into the project (replace the generated ones).
 3. In `stm32f1xx_hal_conf.h` enable `HAL_ADC`, `HAL_FLASH`, `HAL_GPIO`, `HAL_I2C`, `HAL_IWDG`, `HAL_RCC`,
-   `HAL_TIM`, `HAL_CORTEX` modules.
+   `HAL_TIM`, `HAL_UART`, `HAL_CORTEX` modules.
 4. **Reserve the calibration page.** It lives at `0x0800FC00`. In `STM32F103C8TX_FLASH.ld` change
    `FLASH ... LENGTH = 64K` to `63K`.
 5. Any optimisation level works; timing uses the DWT cycle counter. Float `printf` is not used.
@@ -104,7 +105,7 @@ Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 
 | `PAN_DIR` | top | If the servo runs away from a torch, flip the sign – the runaway fault will tell you. |
 | Servo limits | `PAN_MIN/MAX_PULSE` | Set `SERVO_SWEEP_TEST 1`, flash, listen for grinding, press the button, keep the limits ≈ 50 µs inside, set it back to `0`. |
 | Park position | `PARK_PAN_PULSE` | Aim at the sunrise side. With `PAN_DIR` +1 a higher pulse turns towards the **right** LDR – which side is east depends on how you mounted it. |
-| Night thresholds | `NIGHT_ENTER/EXIT_ADC_SUM` | Sums of two ADC readings (0–8190). Watch `last_sum` (shown as `S…` on the OLED) at dusk. Defaults suit a 4.7 k divider. |
+| Night thresholds | `NIGHT_ENTER/EXIT_ADC_SUM` | Sums of two ADC readings (0–8190). Watch `last_sum` (shown as `S=…` over serial) at dusk. Defaults suit a 4.7 k divider. |
 | Mains frequency | `MAINS_HZ` | 50 or 60. Sets the ADC averaging window to one mains cycle. |
 | Panel mismatch | `K_MISMATCH_X1000` | Run both panels flat side by side, set `P_fixed / P_tracked × 1000`. |
 | Mode after reset | `BOOT_MODE` | `MODE_FIELD` for a permanent outdoor install. |
@@ -116,7 +117,7 @@ Blue Pill 3V3 ─► 2 LDR (top legs), INA219 ×3 VCC, OLED VCC   (+100 µF/100 
   holds position until someone resets it; an automatic retry after some minutes would be a possible addition.
 * The **mode is not saved** – set `BOOT_MODE` instead.
 * Energy is integrated from instantaneous INA219 readings every 500 ms and is **lost on reset** (RAM only).
-* The OLED shows tracked/fixed power and energy; nothing is logged off-board.
+* Telemetry and power comparisons are streamed to the laptop serial monitor; nothing is logged on-board.
 
 ## 5. Host tests
 
@@ -131,13 +132,13 @@ gcc -std=c11 -Wall -Wextra -Wshadow -I. test.c -o test && ./test
 1. **Unpowered continuity:** 5 V↔GND, 3V3↔GND, 5 V↔3V3, 9 V↔GND all open (> 1 kΩ).
 2. **LM2596 alone** (nothing on its output): trim to 5.00 V. Seal the screw.
 3. **Blue Pill alone** on the 5 V bus: `3V3` pin = 3.30 V ± 0.1.
-4. **Flash over SWD.** With the I²C modules not yet connected the LED shows the double blink – expected.
+4. **Flash over SWD.** Connect the USB-to-TTL adapter to PA9 (TX) / PA10 (RX) and star GND. Open a serial monitor at 115200 8N1.
 5. **LDR dividers:** torch on each LDR – PA0 / PA1 swing between roughly 0.1 V and 3.1 V.
-6. **I²C modules:** boot screen shows `OLED:OK INA1:OK INA2:OK INA3:OK`. A `--` means an address bridge
+6. **I²C modules:** serial boot banner reports `INA1:OK  INA2:OK  INA3:OK`. A `--` means an address bridge
    (INA #2 → A0 = 0x41, #3 → A1 = 0x44) or wiring problem.
-7. **Servo last**, ideally from a bench supply limited to ~1 A. No reset or OLED glitch at start-up.
+7. **Servo last**, ideally from a bench supply limited to ~1 A. Verify initialization without brownout resets.
 8. **Sweep test** (§4.3) to set the limits, then restore `SERVO_SWEEP_TEST 0`.
 9. **Direction test** in Demo mode with a torch. If it runs away, flip `PAN_DIR`.
-10. **Calibrate** (hold button > 2 s under diffuse light). Expect `CAL SAVED`; power-cycle and check it persists.
+10. **Calibrate** (hold button > 2 s under diffuse light). Expect `CAL SAVED` over serial; power-cycle and check it persists.
 11. **Night test:** cover the head – it parks after ≈ 1.5 s in Demo; uncover – it sweeps and resumes tracking.
-12. **Panels last:** connect both panels through the INA219s and load resistors; compare `GAIN` on the OLED.
+12. **Panels last:** connect both panels through the INA219s and load resistors; inspect `GAIN_x10` over serial.

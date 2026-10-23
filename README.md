@@ -33,7 +33,7 @@ The diagram below is a **wire-by-wire connection reference** — accurate enough
 | **TowerPro MG90S Servo** | 1 | 2 | Metal-gear servo ($2.2\text{ kg}\cdot\text{cm}$) for Pan (Azimuth) |
 | **GL5528 CdS LDR** | 2 | 4 | Left & Right light differential sensors with 35–40 mm center shadow baffle |
 | **INA219 I²C Power Module** | 3 | 4 | Multi-drop power sensor with solder pads for A0/A1 addressing |
-| **SSD1306 0.96″ OLED** | 1 | 1 | Real-time telemetry dashboard (128×64 resolution, address `0x3C`) |
+| **USB-to-TTL Serial Adapter** | 1 | 1 | CP2102 / CH340 / FT232 (3.3 V logic) for laptop serial telemetry (115200 8N1) |
 | **6V 3W Polycrystalline Panel** | 2 | 2 | Matched pair (1× Tracked DUT, 1× Fixed Reference) |
 | **10–12 Ω 5W Resistor** | 2 | 4 | MPP test load resistors matched within $\pm 0.1\ \Omega$ (heatsinked) |
 | **LM2596 DC-DC Buck Converter** | 1 | 2 | High-efficiency step-down to regulated 5.00 V |
@@ -61,14 +61,16 @@ The diagram below is a **wire-by-wire connection reference** — accurate enough
 | **`PA4`** | `GPIO_Input` | Mode / Calibrate Button | Active-low pushbutton to GND (Internal pull-up) |
 | **`PA6`** | `TIM3_CH1` | **Pan (Azimuth) Servo PWM** | 330 Ω series resistor; external $10\text{ k}\Omega$ pull-down to GND required |
 | **`PA7`** | *Not Used* | — | Leave unconnected (formerly Tilt Servo) |
-| **`PB6`** | `I2C1_SCL` | Shared I²C SCL Bus Line | OLED (`0x3C`) + INA219s (`0x40`, `0x41`, `0x44`) |
+| **`PA9`** | `USART1_TX` | Adapter RX | Telemetry to laptop serial monitor (115200 8N1, 3.3 V logic) |
+| **`PA10`** | `USART1_RX` | Adapter TX | Serial input from laptop (3.3 V logic, reserved for future commands) |
+| **`PB6`** | `I2C1_SCL` | Shared I²C SCL Bus Line | INA219s (`0x40`, `0x41`, `0x44`). OLED removed |
 | **`PB7`** | `I2C1_SDA` | Shared I²C SDA Bus Line | Shared 3.3 V I²C data line |
-| **`PC13`** | `GPIO_Output` | Status LED | Active-low onboard LED |
+| **`PC13`** | *Not Used* | — | Leave unconnected (status LED no longer used) |
 | **`5V`**   | Power In | LM2596 Output (5.00V) | Must be trimmed to **$5.00\text{ V} \pm 0.05\text{ V}$** before connecting |
-| **`3.3V`** | Power Out | Sensor & Display Rail | Sourced from onboard LDO (≤150 mA max) |
+| **`3.3V`** | Power Out | Sensor Rail | Sourced from onboard LDO (≤150 mA max) |
 
 > [!IMPORTANT]
-> **PA2, PA3, PA7 are no longer used.** Leave these pins unconnected. Do not connect the second servo (tilt) or the bottom LDRs — they are removed in this revision.
+> **PA2, PA3, PA7, PC13 are no longer used.** Leave these pins unconnected. Status and telemetry are transmitted directly over USART1 (PA9/PA10) to the connected computer.
 
 ---
 
@@ -102,7 +104,7 @@ For a single-axis azimuth tracker, the two LDRs must be mounted with a **vertica
 | **INA219 Power Module** | ![INA219 Module](images/ina219_module.jpg) | High-side current/voltage monitor. Address configured via A0/A1 solder bridges. |
 | **MG90S Servo** | ![MG90S Servo](images/mg90s_servo.jpg) | Metal-gear micro servo. Orange = Signal (PA6), Red = 5V Rail, Brown = GND. **Single servo only.** |
 | **LM2596 Buck Converter** | ![LM2596 Converter](images/lm2596_module.jpg) | Multi-turn trimmer adjusts 7-12V input down to regulated 5.00 V system power. |
-| **SSD1306 OLED** | ![SSD1306 Display](images/ssd1306_oled.jpg) | 128×64 pixel display on I²C address `0x3C`. Powered from 3.3 V rail. |
+| **USB-to-TTL Adapter** | *(External)* | USB-to-serial link (CP2102/CH340/FT232) on PA9/PA10. Connects to laptop serial monitor at 115200 8N1. (Replaces SSD1306 OLED) |
 | **Protection Hardware** | ![Protection Components](images/protection_components.jpg) | Schottky diode + 2A glass fuse + DC barrel jack socket. Photo shows a 1N5819 (1 A) – fit a 3 A part (SS34 / 1N5822). |
 
 ---
@@ -138,12 +140,12 @@ This repository contains exhaustive engineering documentation, design reviews, f
    * STM32CubeIDE setup, tuning table, safe bring-up order with pass/fail criteria
 
 4. 💻 **[Firmware Source Code](Core/)**
-   * `Core/Src/main.c` – complete single-axis firmware (tracking, INA219 telemetry, SSD1306 dashboard, flash calibration)
+   * `Core/Src/main.c` – complete single-axis firmware (tracking, INA219 telemetry, laptop serial stream, flash calibration)
    * `Core/Inc/main.h`, `Core/Src/stm32f1xx_it.c` – header and exception handlers
    * DWT cycle-counter timing, 20 ms mains-hum rejection, runaway / open-LDR detection, sun search, watchdog
 
 5. 🧪 **[Host Unit Testing Suite](tests/)**
-   * PC test suite running `main.c` against a fake HAL (INA219 maths, azimuth controller, calibration flash round-trip, night logic, dashboard)
+   * PC test suite running `main.c` against a fake HAL (INA219 maths, azimuth controller, calibration flash round-trip, night logic, laptop serial display)
 
 > The two long documents above (`solar_tracker_hardware_manual.md`, `hardware_audit_report.md`) were written for the earlier **dual-axis** design (4 LDRs, 2 servos). Where they disagree with this README, `FIXES.md` or `Core/`, the latter win.
 
@@ -158,7 +160,7 @@ This repository contains exhaustive engineering documentation, design reviews, f
    * INA219 #1 (Tracked Panel): Leave A0 & A1 open (`0x40`)
    * INA219 #2 (System Power): Bridge **A0** (`0x41`)
    * INA219 #3 (Fixed Panel): Bridge **A1** (`0x44`)
-5. **Verify I²C devices:** The boot screen must show `OLED:OK INA1:OK INA2:OK INA3:OK` (`0x3C`, `0x40`, `0x41`, `0x44`).
+5. **Verify I²C devices:** The boot banner over serial (115200 8N1) will report `INA1:OK  INA2:OK  INA3:OK` (`0x40`, `0x41`, `0x44`).
 6. **Connect Servo Last:** Power servo via a current-limited bench supply set to 1 A initially to verify smooth initialization.
 7. **Calibrate Sensors:** Hold button on `PA4` for >2s under **uniform lighting** (point both LDRs at an even sky/lamp) to store the relative LDR gains in flash. Short press = Demo ⇄ Field mode.
 

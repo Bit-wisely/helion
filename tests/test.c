@@ -29,6 +29,20 @@ HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *h, uint16_t a, uint32
 HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *pe)
 { (void)e; (void)pe; memset(flash_w, 0xFF, sizeof flash_w); return HAL_OK; }
 
+static char uart_buf[1024];
+static uint16_t uart_len = 0;
+HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, const uint8_t *pData, uint16_t Size, uint32_t Timeout)
+{
+    (void)huart; (void)Timeout;
+    if (uart_len + Size < sizeof(uart_buf)) {
+        memcpy(uart_buf + uart_len, pData, Size);
+        uart_len += Size;
+        uart_buf[uart_len] = '\0';
+    }
+    return HAL_OK;
+}
+static void clear_uart(void) { uart_len = 0; uart_buf[0] = '\0'; }
+
 /* Cal_Load / Cal_Save read the flash through this macro; point it at the fake page */
 #define CAL_WORD(i) (flash_w[i])
 #include "../Core/Src/main.c"
@@ -42,10 +56,11 @@ static void set_adc(uint16_t l, uint16_t r) { stub_adc[0] = l; stub_adc[1] = r; 
 
 int main(void)
 {
-    /* --- font table --- */
-    CHECK(sizeof(font5x7) / sizeof(font5x7[0]) == 59, "font has 59 glyphs (0x20..0x5A)");
-    CHECK(font5x7['A' - 0x20][0] == 0x7C && font5x7['Z' - 0x20][4] == 0x43 && font5x7['0' - 0x20][0] == 0x3E,
-          "font spot-check A/Z/0");
+    /* --- USART1 init and I2C probing --- */
+    MX_USART1_UART_Init();
+    CHECK(huart1.Init.BaudRate == 115200, "uart: configured for 115200 baud");
+    CHECK(huart1.Init.WordLength == UART_WORDLENGTH_8B && huart1.Init.StopBits == UART_STOPBITS_1, "uart: 8N1 framing");
+    CHECK(!I2C_Probe(0x3C), "i2c: probe explicitly skips OLED 0x3C");
 
     /* --- INA219 decoding --- */
     ina_bus = (uint16_t)((5120 / 4) << 3); ina_shunt = 1234;      /* 5.120 V, 12.34 mV -> 123.4 mA */
@@ -165,21 +180,36 @@ int main(void)
     int32_t g; CHECK(Gain_Tenths(&g) && g == 100, "gain: +10.0 % when tracked = 1.1 x fixed");
     ina_fix.mw = 10; CHECK(!Gain_Tenths(&g), "gain: hidden when the reference panel is dark");
 
-    /* --- Dashboard: every line fits in 21 characters --- */
-    ina_sys.online = true; oled_online = true;
-    ina_trk.mv = 26000; ina_trk.ma10 = 12345; ina_fix.mv = 5120; ina_fix.ma10 = 1200;
-    ina_fix.mw = 700; ina_trk.mw = 2000;
-    energy_trk = 360000000000ULL * 12; err_az = -1000; last_sum = 8190; faults = FAULT_PAN_RUNAWAY;
-    ax_pan.at_limit = true;
-    Display_Task(10000, true);
-    int worst = 0; char l[48]; int n;
-    n = snprintf(l, sizeof l, "HELION %s %s", "FIELD", "SEARCH"); if (n > worst) worst = n;
-    n = snprintf(l, sizeof l, "TRK %lu.%02luV %ld.%ldMA", 26UL, 0UL, 1234L, 5L); if (n > worst) worst = n;
-    n = snprintf(l, sizeof l, "PWR T%lu F%lu MW", 9999UL, 9999UL); if (n > worst) worst = n;
-    n = snprintf(l, sizeof l, "E T%lu.%lu F%lu.%lu MWH", 1234UL, 5UL, 1234UL, 5UL); if (n > worst) worst = n;
-    n = snprintf(l, sizeof l, "AZ%+04ld S%lu %s", -1000L, 8190UL, "LIMIT"); if (n > worst) worst = n;
-    CHECK(worst <= 21, "dashboard: worst-case line <= 21 characters");
-    CHECK(strlen("CAL FAIL: LIGHT") < sizeof ui_msg && strlen("CAL FAIL: FLASH") < sizeof ui_msg, "dashboard: messages fit ui_msg");
+    /* --- Status text states (replaces PC13 LED indications) --- */
+    ina_trk.online = ina_sys.online = ina_fix.online = true;
+    faults = FAULT_LDR; CHECK(strcmp(Status_Text(), "FAULT") == 0, "status: FAULT when faults active");
+    faults = 0; is_parked = true; CHECK(strcmp(Status_Text(), "PARKED") == 0, "status: PARKED when parked");
+    is_parked = false; ina_trk.online = false; CHECK(strcmp(Status_Text(), "I2C MISSING") == 0, "status: I2C MISSING when sensor offline");
+    ina_trk.online = true; searching = true; CHECK(strcmp(Status_Text(), "SEARCH") == 0, "status: SEARCH when sun searching");
+    searching = false; CHECK(strcmp(Status_Text(), "TRACK") == 0, "status: TRACK during normal tracking");
+
+    /* --- Laptop serial display telemetry format --- */
+    ina_trk.online = ina_sys.online = ina_fix.online = true;
+    ina_trk.mv = 5810; ina_trk.ma10 = 3120; ina_trk.mw = 1813;
+    ina_fix.mv = 5790; ina_fix.ma10 = 2680; ina_fix.mw = 1552;
+    ina_sys.mv = 8920; ina_sys.ma10 = 4100;
+    energy_trk = 3600000000ULL * 42;
+    energy_fix = 3600000000ULL * 36;
+    err_az = 12; last_sum = 5120; faults = 0; mode = MODE_FIELD;
+    clear_uart();
+    Display_Task(HAL_GetTick() + 1000, true);
+    const char *expected =
+        "HELION,mode=FIELD,st=TRACK,az=+012,S=5120\r\n"
+        "TRK,v_mV=5810,i_mA=312,p_mW=1813\r\n"
+        "FIX,v_mV=5790,i_mA=268,p_mW=1552\r\n"
+        "SYS,v_mV=8920,i_mA=410\r\n"
+        "GAIN_x10=+168,E_T_x10=42,E_F_x10=36\r\n";
+    CHECK(strcmp(uart_buf, expected) == 0, "telemetry: matches exact design specification block");
+    CHECK(strlen(uart_buf) > 0 && strlen(uart_buf) < sizeof(uart_buf), "telemetry: transmission buffer within bounds");
+
+    clear_uart();
+    Set_UI_Message("CAL SAVED", 3000);
+    CHECK(strcmp(uart_buf, "CAL SAVED\r\n") == 0, "ui message: transmitted immediately over serial");
 
     printf("\n%s (%d failure%s)\n", fails ? "SOME TESTS FAILED" : "ALL TESTS PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;
