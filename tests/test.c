@@ -1,11 +1,22 @@
-/* Host-side unit tests for Core/Src/main.c (single-axis Helion firmware).
- * Build:  gcc -std=c11 -Wall -Wextra -Wshadow -I. test.c -o test && ./test
+/* Host-side unit tests for Core/Src/main.c (single-axis Helion firmware, laptop display).
+ * Build:  gcc -std=c11 -Wall -Wextra -Wshadow -I. test.c -o test && ./test [sample_lines.txt]
  * tests/main.h is a fake of the STM32 HAL for the PC; it is NOT the real header. */
 #define HELION_UNIT_TEST 1
 #include "main.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ---- fake serial port ---- */
+USART_TypeDef fake_usart;
+static char     tx_buf[16384]; static size_t tx_len = 0;
+static const char *rx_src = ""; static size_t rx_pos = 0, rx_total = 0;
+HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *d, uint16_t n, uint32_t t)
+{ (void)h; (void)t; if (tx_len + n < sizeof tx_buf) { memcpy(tx_buf + tx_len, d, n); tx_len += n; tx_buf[tx_len] = 0; } return HAL_OK; }
+static void tx_clear(void) { tx_len = 0; tx_buf[0] = 0; }
+static void rx_feed(const char *s) { rx_src = s; rx_pos = 0; rx_total = strlen(s); }
+#define SERIAL_RXNE()  (rx_pos < rx_total)
+#define SERIAL_READ()  ((uint8_t)rx_src[rx_pos++])
 
 /* ---- stub state ---- */
 GPIO_TypeDef gA, gB, gC; GPIO_TypeDef *GPIOA = &gA, *GPIOB = &gB, *GPIOC = &gC;
@@ -29,20 +40,6 @@ HAL_StatusTypeDef HAL_I2C_IsDeviceReady(I2C_HandleTypeDef *h, uint16_t a, uint32
 HAL_StatusTypeDef HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *e, uint32_t *pe)
 { (void)e; (void)pe; memset(flash_w, 0xFF, sizeof flash_w); return HAL_OK; }
 
-static char uart_buf[1024];
-static uint16_t uart_len = 0;
-HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, const uint8_t *pData, uint16_t Size, uint32_t Timeout)
-{
-    (void)huart; (void)Timeout;
-    if (uart_len + Size < sizeof(uart_buf)) {
-        memcpy(uart_buf + uart_len, pData, Size);
-        uart_len += Size;
-        uart_buf[uart_len] = '\0';
-    }
-    return HAL_OK;
-}
-static void clear_uart(void) { uart_len = 0; uart_buf[0] = '\0'; }
-
 /* Cal_Load / Cal_Save read the flash through this macro; point it at the fake page */
 #define CAL_WORD(i) (flash_w[i])
 #include "../Core/Src/main.c"
@@ -54,14 +51,29 @@ static int fails = 0;
 #define CHECK(c, msg) do { if (!(c)) { printf("FAIL: %s\n", msg); fails++; } else printf("ok:   %s\n", msg); } while (0)
 static void set_adc(uint16_t l, uint16_t r) { stub_adc[0] = l; stub_adc[1] = r; }
 
-int main(void)
+/* Validate "$HEL,...*HH": checksum matches and every expected key is present. */
+static int line_ok(const char *line, size_t len)
 {
-    /* --- USART1 init and I2C probing --- */
-    MX_USART1_UART_Init();
-    CHECK(huart1.Init.BaudRate == 115200, "uart: configured for 115200 baud");
-    CHECK(huart1.Init.WordLength == UART_WORDLENGTH_8B && huart1.Init.StopBits == UART_STOPBITS_1, "uart: 8N1 framing");
-    CHECK(!I2C_Probe(0x3C), "i2c: probe explicitly skips OLED 0x3C");
+    if (len < 8 || line[0] != '$') return 0;
+    const char *star = memchr(line, '*', len);
+    if (!star || (size_t)(line + len - star) != 3) return 0;
+    uint8_t x = 0; for (const char *c = line + 1; c < star; c++) x ^= (uint8_t)*c;
+    char hex[3] = { star[1], star[2], 0 };
+    return x == (uint8_t)strtoul(hex, NULL, 16);
+}
+static const char *KEYS[] = { "t=", "mode=", "st=", "flt=", "az=", "pan=", "sum=", "lim=", "ina=", "tv=", "ti=", "tp=",
+                              "fv=", "fi=", "fp=", "sv=", "si=", "sp=", "gain=", "et=", "ef=" };
+static int has_all_keys(const char *line)
+{
+    for (size_t i = 0; i < sizeof KEYS / sizeof KEYS[0]; i++) {
+        char k[16]; snprintf(k, sizeof k, ",%s", KEYS[i]);
+        if (!strstr(line, k) && !(i == 0 && strstr(line, "$HEL,t="))) return 0;
+    }
+    return 1;
+}
 
+int main(int argc, char **argv)
+{
     /* --- INA219 decoding --- */
     ina_bus = (uint16_t)((5120 / 4) << 3); ina_shunt = 1234;      /* 5.120 V, 12.34 mV -> 123.4 mA */
     Ina219_t d = { .addr7 = 0x40 };
@@ -180,36 +192,107 @@ int main(void)
     int32_t g; CHECK(Gain_Tenths(&g) && g == 100, "gain: +10.0 % when tracked = 1.1 x fixed");
     ina_fix.mw = 10; CHECK(!Gain_Tenths(&g), "gain: hidden when the reference panel is dark");
 
-    /* --- Status text states (replaces PC13 LED indications) --- */
-    ina_trk.online = ina_sys.online = ina_fix.online = true;
-    faults = FAULT_LDR; CHECK(strcmp(Status_Text(), "FAULT") == 0, "status: FAULT when faults active");
-    faults = 0; is_parked = true; CHECK(strcmp(Status_Text(), "PARKED") == 0, "status: PARKED when parked");
-    is_parked = false; ina_trk.online = false; CHECK(strcmp(Status_Text(), "I2C MISSING") == 0, "status: I2C MISSING when sensor offline");
-    ina_trk.online = true; searching = true; CHECK(strcmp(Status_Text(), "SEARCH") == 0, "status: SEARCH when sun searching");
-    searching = false; CHECK(strcmp(Status_Text(), "TRACK") == 0, "status: TRACK during normal tracking");
-
-    /* --- Laptop serial display telemetry format --- */
+    /* --- Telemetry line --- */
+    char line[320]; size_t n;
     ina_trk.online = ina_sys.online = ina_fix.online = true;
     ina_trk.mv = 5810; ina_trk.ma10 = 3120; ina_trk.mw = 1813;
     ina_fix.mv = 5790; ina_fix.ma10 = 2680; ina_fix.mw = 1552;
-    ina_sys.mv = 8920; ina_sys.ma10 = 4100;
-    energy_trk = 3600000000ULL * 42;
-    energy_fix = 3600000000ULL * 36;
-    err_az = 12; last_sum = 5120; faults = 0; mode = MODE_FIELD;
-    clear_uart();
-    Display_Task(HAL_GetTick() + 1000, true);
-    const char *expected =
-        "HELION,mode=FIELD,st=TRACK,az=+012,S=5120\r\n"
-        "TRK,v_mV=5810,i_mA=312,p_mW=1813\r\n"
-        "FIX,v_mV=5790,i_mA=268,p_mW=1552\r\n"
-        "SYS,v_mV=8920,i_mA=410\r\n"
-        "GAIN_x10=+168,E_T_x10=42,E_F_x10=36\r\n";
-    CHECK(strcmp(uart_buf, expected) == 0, "telemetry: matches exact design specification block");
-    CHECK(strlen(uart_buf) > 0 && strlen(uart_buf) < sizeof(uart_buf), "telemetry: transmission buffer within bounds");
+    ina_sys.mv = 8920; ina_sys.ma10 = 4100; ina_sys.mw = 3657;
+    mode = MODE_DEMO; faults = 0; is_parked = false; searching = false;
+    err_az = -120; pan_pulse = 1510; last_sum = 3200; ax_pan.at_limit = false;
+    energy_trk = 3600000000ULL * 42; energy_fix = 3600000000ULL * 36;
+    n = Telemetry_Format(line, sizeof line);
+    CHECK(line_ok(line, n), "telemetry: checksum is correct");
+    CHECK(has_all_keys(line), "telemetry: all 21 keys present");
+    CHECK(strstr(line, "mode=DEMO,st=TRACK,flt=0,az=-120,pan=1510,sum=3200") != NULL, "telemetry: mode/status/az/pan/sum");
+    CHECK(strstr(line, "tv=5810,ti=3120,tp=1813,fv=5790,fi=2680,fp=1552,sv=8920,si=4100,sp=3657") != NULL, "telemetry: panel and rail values");
+    CHECK(strstr(line, "gain=168,et=42,ef=36") != NULL, "telemetry: gain +16.8 % and energy in 0.1 mWh");
+    CHECK(strstr(line, "ina=7") != NULL, "telemetry: all three INA219 online -> ina=7");
+    ina_fix.mw = 10; n = Telemetry_Format(line, sizeof line);
+    CHECK(strstr(line, "gain=na") != NULL && line_ok(line, n), "telemetry: gain=na when the reference panel is dark");
+    ina_fix.mw = 1552; ina_fix.online = false;
+    n = Telemetry_Format(line, sizeof line);
+    CHECK(strstr(line, "ina=3") != NULL && strstr(line, "gain=na") != NULL, "telemetry: INA #3 offline -> ina=3, gain=na");
+    ina_fix.online = true;
 
-    clear_uart();
-    Set_UI_Message("CAL SAVED", 3000);
-    CHECK(strcmp(uart_buf, "CAL SAVED\r\n") == 0, "ui message: transmitted immediately over serial");
+    /* worst case: biggest numbers everywhere must still fit and stay valid */
+    ina_trk.mv = ina_fix.mv = ina_sys.mv = 32000; ina_trk.ma10 = ina_fix.ma10 = ina_sys.ma10 = 327670;
+    ina_trk.mw = ina_fix.mw = ina_sys.mw = 4294967295U;
+    energy_trk = energy_fix = 0xFFFFFFFFFFFFFFFFULL; err_az = -1000; last_sum = 8190; faults = 3; pan_pulse = 2100;
+    ax_pan.at_limit = true; mode = MODE_FIELD; searching = true;
+    n = Telemetry_Format(line, sizeof line - 2);
+    CHECK(line_ok(line, n) && n < 300, "telemetry: worst-case line fits the 300-byte buffer with a valid checksum");
+    CHECK(strstr(line, "mode=FIELD,st=FAULT") != NULL && strstr(line, "flt=3") != NULL, "telemetry: fault outranks search in st=");
+    printf("      worst-case line is %zu bytes (about %zu ms at 115200)\n", n, (n + 2) * 10 * 1000 / SERIAL_BAUD);
+    faults = 0; searching = false; mode = MODE_DEMO; ax_pan.at_limit = false;
+    ina_trk.mv = 5810; ina_trk.ma10 = 3120; ina_trk.mw = 1813; ina_fix.mv = 5790; ina_fix.ma10 = 2680; ina_fix.mw = 1552;
+    ina_sys.mv = 8920; ina_sys.ma10 = 4100; ina_sys.mw = 3657; energy_trk = 3600000000ULL * 42; energy_fix = 3600000000ULL * 36;
+    err_az = -120; last_sum = 3200; pan_pulse = 1510;
+
+    /* --- Serial_Task: periodic telemetry + events --- */
+    tx_clear(); last_faults_sent = 0; last_ina_mask_sent = 7; last_parked_sent = false;
+    Serial_Task(5000);
+    CHECK(strncmp(tx_buf, "$HEL,", 5) == 0 && strstr(tx_buf, "\r\n") != NULL, "serial: first call emits a CRLF-terminated telemetry line");
+    size_t before = tx_len; Serial_Task(5400);
+    CHECK(tx_len == before, "serial: nothing more inside the 1 s interval");
+    Serial_Task(6100);
+    CHECK(tx_len > before, "serial: next line after the interval");
+    tx_clear(); faults = FAULT_PAN_RUNAWAY; Serial_Task(6200);
+    CHECK(strstr(tx_buf, "#EVT FAULT PAN RUNAWAY") != NULL, "event: pan runaway fault is announced once");
+    tx_clear(); Serial_Task(6300);
+    CHECK(strstr(tx_buf, "#EVT") == NULL, "event: not repeated");
+    faults = FAULT_LDR; tx_clear(); Serial_Task(6400);
+    CHECK(strstr(tx_buf, "#EVT FAULT LDR") != NULL, "event: LDR fault announced");
+    faults = 0; tx_clear(); Serial_Task(6500);
+    CHECK(strstr(tx_buf, "#EVT FAULTS CLEARED") != NULL, "event: faults cleared announced");
+    is_parked = true; tx_clear(); Serial_Task(6600);
+    CHECK(strstr(tx_buf, "#EVT PARKED") != NULL, "event: parked announced");
+    is_parked = false; tx_clear(); Serial_Task(6700);
+    CHECK(strstr(tx_buf, "#EVT UNPARKED") != NULL, "event: unparked announced");
+    ina_sys.online = false; tx_clear(); Serial_Task(6800);
+    CHECK(strstr(tx_buf, "#EVT INA ONLINE MASK 5") != NULL, "event: INA219 dropping off the bus is announced");
+    ina_sys.online = true; Serial_Task(6900);
+
+    /* --- Boot banner --- */
+    tx_clear(); boot_wdg_reset = true; Serial_Banner(); boot_wdg_reset = false;
+    CHECK(strstr(tx_buf, "#HELION single-axis solar tracker fw=" HELION_FW_VERSION) != NULL && strstr(tx_buf, "#BOOT ina=7 wdg_reset=1") != NULL,
+          "banner: version, baud and boot status (watchdog flag)");
+
+    /* --- Commands from the laptop --- */
+    mode = MODE_DEMO; tx_clear(); rx_feed("mode\r\n"); Serial_RxTask();
+    CHECK(mode == MODE_FIELD && strstr(tx_buf, "#EVT MODE FIELD") != NULL, "command: MODE (any case) toggles DEMO -> FIELD");
+    rx_feed("MODE\n"); Serial_RxTask(); CHECK(mode == MODE_DEMO, "command: MODE again returns to DEMO");
+    faults = FAULT_PAN_RUNAWAY; tx_clear(); rx_feed("CLEAR\n"); Serial_RxTask();
+    CHECK(faults == 0 && force_track, "command: CLEAR resets faults and forces a tracker step");
+    tx_clear(); rx_feed("STATUS\n"); Serial_RxTask();
+    CHECK(strncmp(tx_buf, "$HEL,", 5) == 0, "command: STATUS sends a telemetry line immediately");
+    set_adc(2000, 2200); cal_q[0] = cal_q[1] = 4096; tx_clear(); rx_feed("CAL\n"); Serial_RxTask();
+    CHECK(strstr(tx_buf, "#EVT CAL SAVED") != NULL && cal_q[0] != 4096, "command: CAL stores gains under even light");
+    set_adc(100, 100); tx_clear(); rx_feed("CAL\n"); Serial_RxTask();
+    CHECK(strstr(tx_buf, "#EVT CAL FAIL LIGHT") != NULL, "command: CAL refused in the dark");
+    Cal_Defaults();
+    mode = MODE_DEMO; tx_clear(); rx_feed("xyz\n"); Serial_RxTask();
+    CHECK(strstr(tx_buf, "#EVT UNKNOWN COMMAND") != NULL && mode == MODE_DEMO, "command: unknown text is rejected, nothing changes");
+    tx_clear(); rx_feed("MODEMODEMODEMODEMODE\n"); Serial_RxTask();
+    CHECK(strstr(tx_buf, "#EVT UNKNOWN COMMAND") != NULL && mode == MODE_DEMO, "command: over-long line is rejected, not truncated into MODE");
+    tx_clear(); rx_feed("m"); Serial_RxTask(); rx_feed("\x01\xFF\x7F"); Serial_RxTask();
+    CHECK(mode == MODE_DEMO && tx_len == 0, "command: noise without a line ending does nothing");
+    rx_feed("\n"); Serial_RxTask(); tx_clear();
+    rx_feed("\n\r\n"); Serial_RxTask();
+    CHECK(tx_len == 0, "command: empty lines are ignored");
+    rx_feed("MODE\r\n"); Serial_RxTask(); rx_feed("MODE\r\n"); Serial_RxTask();
+    CHECK(mode == MODE_DEMO, "command: CRLF is one command, not two");
+
+    /* --- Sample lines for the laptop-side parsers (optional argument) --- */
+    if (argc > 1) {
+        FILE *f = fopen(argv[1], "w");
+        if (f) {
+            mode = MODE_DEMO; faults = 0; Telemetry_Format(line, sizeof line); fprintf(f, "%s\n", line);
+            ina_fix.online = false; Telemetry_Format(line, sizeof line); fprintf(f, "%s\n", line);
+            ina_fix.online = true; faults = 2; is_parked = true; mode = MODE_FIELD; Telemetry_Format(line, sizeof line); fprintf(f, "%s\n", line);
+            fclose(f);
+        }
+    }
 
     printf("\n%s (%d failure%s)\n", fails ? "SOME TESTS FAILED" : "ALL TESTS PASSED", fails, fails == 1 ? "" : "s");
     return fails ? 1 : 0;

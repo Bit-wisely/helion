@@ -1,3 +1,8 @@
+> **ARCHIVED: do not build from this document.** It describes the earlier dual-axis design (4 LDRs, 2 servos, SSD1306 OLED, status LED).
+> The current design is single-axis with a laptop display: see `README.md`, `FIXES.md` and `docs/wiring_diagram.png`.
+
+---
+
 # 🔍 Dual-Axis Solar Tracker — Hardware Audit Report
 
 > **Note:** this document was written for the earlier **dual-axis** design (4 LDRs, 2 servos, tilt axis) and some firmware excerpts in it are obsolete. The current design is single-axis; see `README.md`, `FIXES.md` and `Core/` for the authoritative description.

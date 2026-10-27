@@ -10,10 +10,13 @@
 build/
 Debug/
 Release/
+.pio/
+.vscode/
 
 # Temporary files
 *.tmp
 *~
 .DS_Store
+__pycache__/
 
 tests/test

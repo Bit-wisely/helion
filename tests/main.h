@@ -41,9 +41,9 @@ extern GPIO_TypeDef *GPIOC;
 #define GPIO_PIN_3                 ((uint16_t)0x0008)
 #define GPIO_PIN_4                 ((uint16_t)0x0010)
 #define GPIO_PIN_6                 ((uint16_t)0x0040)
-#define GPIO_PIN_7                 ((uint16_t)0x0080)
 #define GPIO_PIN_9                 ((uint16_t)0x0200)
 #define GPIO_PIN_10                ((uint16_t)0x0400)
+#define GPIO_PIN_7                 ((uint16_t)0x0080)
 #define GPIO_PIN_13                ((uint16_t)0x2000)
 
 #define GPIO_MODE_INPUT            0x00000000U
@@ -143,8 +143,10 @@ typedef struct {
 #define I2C_MEMADD_SIZE_8BIT       0x00000001U
 
 /* UART */
+typedef struct { volatile uint32_t SR; volatile uint32_t DR; } USART_TypeDef;
+extern USART_TypeDef fake_usart;
 typedef struct {
-    void *Instance;
+    USART_TypeDef *Instance;
     struct {
         uint32_t BaudRate;
         uint32_t WordLength;
@@ -152,17 +154,20 @@ typedef struct {
         uint32_t Parity;
         uint32_t Mode;
         uint32_t HwFlowCtl;
-        uint32_t OverSampling;
     } Init;
 } UART_HandleTypeDef;
-
-#define USART1                     ((void *)0x40013800UL)
+#define USART1                     (&fake_usart)
 #define UART_WORDLENGTH_8B         0x00000000U
 #define UART_STOPBITS_1            0x00000000U
 #define UART_PARITY_NONE           0x00000000U
 #define UART_MODE_TX_RX            0x0000000CU
 #define UART_HWCONTROL_NONE        0x00000000U
-#define UART_OVERSAMPLING_16       0x00000000U
+#define UART_FLAG_RXNE             0x00000020U
+#define __HAL_RCC_USART1_CLK_ENABLE()  ((void)0)
+#define __HAL_UART_GET_FLAG(h, f)  ((((h)->Instance->SR) & (f)) != 0U)
+static inline void HAL_Delay(uint32_t ms) { (void)ms; }
+static inline HAL_StatusTypeDef HAL_UART_Init(UART_HandleTypeDef *h) { (void)h; return HAL_OK; }
+HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *h, uint8_t *d, uint16_t n, uint32_t t);
 
 /* IWDG */
 typedef struct {
@@ -254,8 +259,6 @@ typedef struct {
 #define __HAL_RCC_GPIOC_CLK_ENABLE()   ((void)0)
 #define __HAL_RCC_ADC1_CLK_ENABLE()    ((void)0)
 #define __HAL_RCC_TIM3_CLK_ENABLE()    ((void)0)
-#define __HAL_RCC_USART1_CLK_ENABLE()  ((void)0)
-#define __HAL_RCC_USART1_CLK_DISABLE() ((void)0)
 #define __HAL_RCC_I2C1_CLK_ENABLE()    ((void)0)
 #define __HAL_RCC_I2C1_CLK_DISABLE()   ((void)0)
 #define __HAL_RCC_I2C1_FORCE_RESET()   ((void)0)
@@ -334,9 +337,6 @@ HAL_StatusTypeDef HAL_I2C_Mem_Read(I2C_HandleTypeDef *h, uint16_t a, uint16_t r,
 
 static inline HAL_StatusTypeDef HAL_IWDG_Init(IWDG_HandleTypeDef *h) { (void)h; return HAL_OK; }
 static inline HAL_StatusTypeDef HAL_IWDG_Refresh(IWDG_HandleTypeDef *h) { (void)h; return HAL_OK; }
-
-static inline HAL_StatusTypeDef HAL_UART_Init(UART_HandleTypeDef *huart) { (void)huart; return HAL_OK; }
-HAL_StatusTypeDef HAL_UART_Transmit(UART_HandleTypeDef *huart, const uint8_t *pData, uint16_t Size, uint32_t Timeout);
 
 static inline HAL_StatusTypeDef HAL_FLASH_Unlock(void) { return HAL_OK; }
 static inline HAL_StatusTypeDef HAL_FLASH_Lock(void) { return HAL_OK; }

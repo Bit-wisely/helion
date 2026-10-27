@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helion tracker dashboard</title>
+<style>
+:root{--bg:#eef1f2;--panel:#fff;--ink:#1b2a33;--mute:#5b6b75;--line:#d3dbdf;--trk:#0b7a4b;--fix:#8a5a00;--bad:#c62828;--ok:#1b7f3b;--warn:#a86400;--acc:#0b6e8a}
+@media (prefers-color-scheme:dark){:root{--bg:#11181c;--panel:#182126;--ink:#e6edf0;--mute:#97a8b1;--line:#2f3f47;--trk:#4fd086;--fix:#f0b45a;--bad:#ff7b7b;--ok:#4fd086;--warn:#f0b45a;--acc:#4cc3e0}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,"Segoe UI",Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+header h1{font-size:1.15rem;margin:0 auto 0 0}
+button{font:inherit;padding:7px 14px;border-radius:7px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+main{max-width:1100px;margin:0 auto;padding:16px}
+.strip{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.pill{padding:4px 12px;border-radius:99px;border:1px solid var(--line);background:var(--panel);font-size:.9rem}
+.pill b{font-weight:600}
+.good{color:var(--ok)}.badc{color:var(--bad)}.warnc{color:var(--warn)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card h2{font-size:.9rem;margin:0 0 4px;color:var(--mute);font-weight:600}
+.big{font-size:1.9rem;font-weight:600;line-height:1.15}
+.sub{color:var(--mute);font-size:.88rem}
+.wide{margin-top:12px}
+canvas{width:100%;height:240px;display:block}
+.gauge{position:relative;height:14px;background:var(--line);border-radius:7px;margin:10px 0 4px}
+.gauge i{position:absolute;top:-3px;width:4px;height:20px;border-radius:2px;background:var(--acc);transform:translateX(-2px)}
+.gauge u{position:absolute;top:0;left:50%;width:1px;height:14px;background:var(--mute)}
+#log{height:170px;overflow:auto;font:13px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap}
+.legend span{margin-right:16px;font-size:.88rem}
+.legend i{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:6px}
+.row{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+#msg{margin:0 0 12px;padding:10px 12px;border-radius:8px;background:var(--panel);border:1px solid var(--warn);display:none}
+</style>
+</head>
+<body>
+<header>
+  <h1>Helion solar tracker</h1>
+  <button id="bConnect" class="primary">Connect to tracker</button>
+  <button id="bDisc" disabled>Disconnect</button>
+  <button id="bSim">Simulate</button>
+</header>
+<main>
+<p id="msg"></p>
+<div class="strip">
+  <span class="pill">Link: <b id="pLink">not connected</b></span>
+  <span class="pill">Mode: <b id="pMode">-</b></span>
+  <span class="pill">State: <b id="pState">-</b></span>
+  <span class="pill">Sensors: <b id="pIna">-</b></span>
+  <span class="pill">Uptime: <b id="pUp">-</b></span>
+</div>
+
+<div class="grid">
+  <div class="card"><h2>Tracked panel</h2><div class="big" id="tP">-</div><div class="sub" id="tS">-</div></div>
+  <div class="card"><h2>Fixed reference panel</h2><div class="big" id="fP">-</div><div class="sub" id="fS">-</div></div>
+  <div class="card"><h2>Tracking gain vs fixed</h2><div class="big" id="gain">-</div><div class="sub">tracked power / fixed power - 1</div></div>
+  <div class="card"><h2>Energy collected</h2><div class="big" id="eT">-</div><div class="sub" id="eF">-</div></div>
+  <div class="card"><h2>System input (9 V rail)</h2><div class="big" id="sP">-</div><div class="sub" id="sS">-</div></div>
+  <div class="card"><h2>Pan servo</h2><div class="big" id="pan">-</div>
+    <div class="gauge"><u></u><i id="panG" style="left:50%"></i></div>
+    <div class="sub" id="az">-</div></div>
+</div>
+
+<div class="card wide">
+  <h2>Power over time</h2>
+  <canvas id="chart" aria-label="Tracked and fixed panel power over time" role="img"></canvas>
+  <div class="legend"><span><i style="background:var(--trk)"></i>Tracked</span><span><i style="background:var(--fix)"></i>Fixed</span><span class="sub" id="chartInfo"></span></div>
+</div>
+
+<div class="card wide">
+  <h2>Controls</h2>
+  <div class="row">
+    <button id="cMode" disabled>Switch DEMO / FIELD</button>
+    <button id="cCal" disabled>Calibrate LDRs (even light!)</button>
+    <button id="cClear" disabled>Clear fault</button>
+    <button id="cStatus" disabled>Ask for status now</button>
+    <button id="bCsv" disabled>Download log (CSV)</button>
+  </div>
+</div>
+
+<div class="card wide"><h2>Event log</h2><div id="log" role="log"></div></div>
+</main>
+
+<script>
+/*PARSER-START*/
+function helionChecksum(body){let x=0;for(let i=0;i<body.length;i++)x^=body.charCodeAt(i);return x}
+/* "$HEL,k=v,...*HH" -> object, or null when it is not a valid telemetry line */
+function parseHelionLine(line){
+  line=line.trim();
+  if(line[0]!=='$'||line.slice(0,5)!=='$HEL,')return null;
+  const star=line.lastIndexOf('*');
+  if(star<0||line.length-star!==3)return null;
+  const body=line.slice(1,star);
+  if(helionChecksum(body)!==parseInt(line.slice(star+1),16))return null;
+  const o={};
+  for(const kv of body.split(',').slice(1)){
+    const e=kv.indexOf('=');if(e<1)return null;
+    const k=kv.slice(0,e),v=kv.slice(e+1);
+    o[k]=/^-?\d+$/.test(v)?parseInt(v,10):v;
+  }
+  for(const k of ['t','mode','st','flt','az','pan','sum','ina','tv','ti','tp','fv','fi','fp','sv','si','sp','gain','et','ef'])
+    if(!(k in o))return null;
+  return o;
+}
+function makeHelionLine(o){ /* used by the simulator */
+  const body='HEL,'+Object.entries(o).map(([k,v])=>k+'='+v).join(',');
+  return '$'+body+'*'+helionChecksum(body).toString(16).toUpperCase().padStart(2,'0');
+}
+/*PARSER-END*/
+
+const $=id=>document.getElementById(id);
+const st={port:null,reader:null,writer:null,sim:null,last:0,rows:[],pts:[],connected:false};
+const PAN_MIN=900,PAN_MAX=2100,MAXPTS=3600;
+
+function say(t,cls){const d=$('log');const l=document.createElement('div');if(cls)l.className=cls;
+  l.textContent=new Date().toLocaleTimeString()+'  '+t;d.appendChild(l);
+  while(d.childNodes.length>500)d.removeChild(d.firstChild);d.scrollTop=d.scrollHeight}
+function banner(t){const m=$('msg');m.textContent=t;m.style.display=t?'block':'none'}
+function setBtns(on){['cMode','cCal','cClear','cStatus'].forEach(i=>$(i).disabled=!on);$('bDisc').disabled=!st.connected}
+
+const f1=(v,d=1)=>v.toFixed(d);
+function render(o){
+  $('pMode').textContent=o.mode;
+  const stc=o.st==='FAULT'?'badc':o.st==='TRACK'?'good':'warnc';
+  $('pState').textContent=o.st+(o.flt?` (${[o.flt&1?'pan runaway':'',o.flt&2?'LDR':''].filter(Boolean).join(', ')})`:'')+(o.lim?' - at end of travel':'');
+  $('pState').className=stc;
+  const names=[[1,'tracked'],[2,'system'],[4,'fixed']].filter(([b])=>!(o.ina&b)).map(x=>x[1]);
+  $('pIna').textContent=names.length?'offline: '+names.join(', '):'all 3 online';
+  $('pIna').className=names.length?'badc':'good';
+  const s=o.t,h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  $('pUp').textContent=(h?h+' h ':'')+m+' min '+(s%60)+' s';
+  const card=(p,sv,sm,sp)=>{$(p+'P').textContent=f1(sp)+' mW';$(p+'S').textContent=f1(sv/1000,2)+' V, '+f1(sm/10)+' mA'};
+  card('t',o.tv,o.ti,o.tp);card('f',o.fv,o.fi,o.fp);card('s',o.sv,o.si,o.sp);
+  $('sP').textContent=f1(o.sp/1000,2)+' W';
+  if(o.gain==='na'){$('gain').textContent='-';$('gain').className='big'}
+  else{const g=o.gain/10;$('gain').textContent=(g>=0?'+':'')+f1(g)+' %';$('gain').className='big '+(g>=0?'good':'badc')}
+  $('eT').textContent=f1(o.et/10)+' mWh';$('eF').textContent='fixed panel: '+f1(o.ef/10)+' mWh';
+  $('pan').textContent=o.pan+' us';
+  $('panG').style.left=Math.max(0,Math.min(100,(o.pan-PAN_MIN)/(PAN_MAX-PAN_MIN)*100))+'%';
+  $('az').textContent='error '+(o.az>0?'+':'')+f1(o.az/10)+' % ('+(o.az>40?'sun is to the right':o.az<-40?'sun is to the left':'centred')+'), light sum '+o.sum;
+  st.pts.push({t:Date.now(),tp:o.tp,fp:o.fp});if(st.pts.length>MAXPTS)st.pts.shift();
+  draw();
+}
+
+function draw(){
+  const c=$('chart'),dpr=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+  c.width=w*dpr;c.height=h*dpr;const g=c.getContext('2d');g.scale(dpr,dpr);
+  const cs=getComputedStyle(document.documentElement),ink=cs.getPropertyValue('--mute'),line=cs.getPropertyValue('--line');
+  const P={l:44,r:8,t:8,b:22},pts=st.pts.slice(-600);
+  g.clearRect(0,0,w,h);g.font='11px system-ui';g.fillStyle=ink;
+  if(pts.length<2){g.fillText('waiting for data...',P.l+8,h/2);$('chartInfo').textContent='';return}
+  let mx=10;for(const p of pts)mx=Math.max(mx,p.tp,p.fp);mx=Math.ceil(mx*1.1/10)*10;
+  const t0=pts[0].t,t1=pts[pts.length-1].t,X=t=>P.l+(t-t0)/Math.max(1,t1-t0)*(w-P.l-P.r),Y=v=>h-P.b-v/mx*(h-P.t-P.b);
+  g.strokeStyle=line;g.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=mx*i/4,y=Y(v);g.beginPath();g.moveTo(P.l,y);g.lineTo(w-P.r,y);g.stroke();g.fillText(Math.round(v)+' mW',2,y+4)}
+  const span=Math.round((t1-t0)/1000);g.fillText(span>=120?Math.round(span/60)+' min ago':span+' s ago',P.l,h-6);g.fillText('now',w-P.r-22,h-6);
+  for(const [k,col] of [['fp','--fix'],['tp','--trk']]){
+    g.strokeStyle=cs.getPropertyValue(col);g.lineWidth=2;g.beginPath();
+    pts.forEach((p,i)=>{i?g.lineTo(X(p.t),Y(p[k])):g.moveTo(X(p.t),Y(p[k]))});g.stroke();
+  }
+  $('chartInfo').textContent='last '+(span>=120?Math.round(span/60)+' min':span+' s');
+}
+
+function handleLine(raw){
+  const line=raw.replace(/\r/g,'').trim();if(!line)return;
+  if(line[0]==='$'){
+    const o=parseHelionLine(line);
+    if(!o){say('corrupt telemetry line ignored','warnc');return}
+    st.last=Date.now();$('pLink').textContent='receiving';$('pLink').className='good';
+    st.rows.push(Object.assign({pc_time:new Date().toISOString()},o));$('bCsv').disabled=false;
+    render(o);
+  }else if(line[0]==='#'){
+    const bad=/FAULT|FAIL|UNKNOWN|MASK [^7]/.test(line);
+    say(line.slice(1).trim(),bad?'badc':'');
+  }
+}
+
+async function send(cmd){
+  const enc=new TextEncoder().encode(cmd+'\n');
+  try{
+    if(st.sim){say('simulator: command '+cmd+' (no hardware attached)');return}
+    await st.writer.write(enc);say('sent '+cmd);
+  }catch(e){say('send failed: '+e.message,'badc')}
+}
+
+async function readLoop(){
+  const dec=new TextDecoder();let buf='';
+  try{
+    while(st.port&&st.port.readable){
+      st.reader=st.port.readable.getReader();
+      try{
+        for(;;){
+          const {value,done}=await st.reader.read();if(done)break;
+          buf+=dec.decode(value,{stream:true});
+          let i;while((i=buf.search(/\n/))>=0){handleLine(buf.slice(0,i));buf=buf.slice(i+1)}
+          if(buf.length>2000)buf='';
+        }
+      }finally{st.reader.releaseLock()}
+    }
+  }catch(e){say('serial read error: '+e.message,'badc')}
+  if(st.connected)await disconnect(true);
+}
+
+async function connect(){
+  if(!('serial' in navigator)){banner('This browser cannot open serial ports. Use Chrome or Edge on the laptop (or press Simulate to preview).');return}
+  try{
+    stopSim();
+    st.port=await navigator.serial.requestPort();
+    await st.port.open({baudRate:115200,dataBits:8,stopBits:1,parity:'none'});
+    st.writer=st.port.writable.getWriter();st.connected=true;banner('');
+    $('bConnect').disabled=true;$('bSim').disabled=true;setBtns(true);
+    $('pLink').textContent='connected, waiting for data';$('pLink').className='warnc';
+    say('serial port open at 115200 baud','good');readLoop();
+  }catch(e){say('could not open the port: '+e.message,'badc')}
+}
+
+async function disconnect(lost){
+  st.connected=false;
+  try{if(st.reader)await st.reader.cancel()}catch(e){}
+  try{if(st.writer){st.writer.releaseLock()}}catch(e){}
+  try{if(st.port)await st.port.close()}catch(e){}
+  st.port=null;$('bConnect').disabled=false;$('bSim').disabled=false;setBtns(false);
+  $('pLink').textContent=lost?'cable unplugged?':'not connected';$('pLink').className=lost?'badc':'';
+  say(lost?'serial link lost':'disconnected',lost?'badc':'');
+}
+
+/* ---- simulator: produces real "$HEL" lines through the same parser ---- */
+function startSim(){
+  if(st.connected)return;stopSim();
+  let t=0;say('simulator running - no hardware attached');setBtns(true);$('bDisc').disabled=false;
+  $('bSim').textContent='Stop simulation';
+  st.sim=setInterval(()=>{
+    t++;const sun=Math.max(0,Math.sin(t/120)),az=Math.round(Math.sin(t/25)*160);
+    const tp=Math.round(2100*sun*(1-Math.abs(az)/2500)+Math.random()*20),fp=Math.round(1700*sun+Math.random()*20);
+    const tv=Math.round(Math.sqrt(tp*10*1000)*1000/1000*1.0),fv=Math.round(Math.sqrt(fp*10*1000));
+    const o={t,mode:'DEMO',st:sun<.05?'PARK':'TRACK',flt:0,az,pan:1500+Math.round(Math.sin(t/60)*400),sum:Math.round(sun*6000),lim:0,ina:7,
+      tv,ti:Math.round(tp/(tv/1000)*10)||0,tp,fv,fi:Math.round(fp/(fv/1000||1)*10)||0,fp,sv:8920,si:Math.round(300+tp/3),sp:Math.round(8.92*(300+tp/3)),
+      gain:fp>50?Math.round((tp/fp-1)*1000):'na',et:Math.round(t*tp/360),ef:Math.round(t*fp/360)};
+    handleLine(makeHelionLine(o));
+    if(t===3)handleLine('#EVT SIMULATED EVENT: sun search done');
+  },1000);
+}
+function stopSim(){if(st.sim){clearInterval(st.sim);st.sim=null;$('bSim').textContent='Simulate';setBtns(false);$('bDisc').disabled=true;$('pLink').textContent='not connected';$('pLink').className=''}}
+
+function downloadCsv(){
+  if(!st.rows.length)return;
+  const cols=Object.keys(st.rows[0]);
+  const csv=[cols.join(',')].concat(st.rows.map(r=>cols.map(c=>r[c]).join(','))).join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));
+  a.download='helion_log_'+new Date().toISOString().replace(/[:.]/g,'-')+'.csv';a.click();URL.revokeObjectURL(a.href);
+}
+
+setInterval(()=>{
+  if(st.connected&&st.last&&Date.now()-st.last>3500){$('pLink').textContent='no data for '+Math.round((Date.now()-st.last)/1000)+' s';$('pLink').className='badc'}
+},1000);
+$('bConnect').onclick=connect;$('bDisc').onclick=()=>st.sim?stopSim():disconnect(false);
+$('bSim').onclick=()=>st.sim?stopSim():startSim();
+$('cMode').onclick=()=>send('MODE');$('cCal').onclick=()=>{if(confirm('Point both light sensors at even, bright, diffuse light (for example an overcast sky) before calibrating. Continue?'))send('CAL')};
+$('cClear').onclick=()=>send('CLEAR');$('cStatus').onclick=()=>send('STATUS');$('bCsv').onclick=downloadCsv;
+window.addEventListener('resize',draw);draw();
+if(!('serial' in navigator))banner('Live connection needs Chrome or Edge (Web Serial). You can still press Simulate to preview this page.');
+</script>
+</body>
+</html>

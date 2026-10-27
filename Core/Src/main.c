@@ -1,30 +1,36 @@
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   Helion single-axis solar tracker firmware
+  * @brief   Helion single-axis solar tracker firmware (laptop-display revision)
   * @target  STM32F103C8T6 "Blue Pill", HSE 8 MHz -> PLL -> 72 MHz, STM32 HAL (F1)
   *
   *  Hardware
   *    PA0  ADC1_IN0   Left  LDR divider      PA1  ADC1_IN1   Right LDR divider
   *    PA4  Button to GND (internal pull-up)  PA6  TIM3_CH1   Pan servo (50 Hz PWM)
-  *    PA9  USART1_TX (115200 8N1)            PA10 USART1_RX  (115200 8N1)
-  *    PB6  I2C1_SCL / PB7 I2C1_SDA
+  *    PB6  I2C1_SCL / PB7 I2C1_SDA           PA9  USART1_TX  -> USB-TTL adapter RX
+  *    PA10 USART1_RX  <- USB-TTL adapter TX
   *    I2C devices: INA219 0x40 (tracked panel), 0x41 (system input),
   *                 0x44 (fixed reference panel)
   *
+  *  There is no on-board display and no LED: everything is shown on the laptop.
+  *  The firmware prints one telemetry line per second (115200 8N1) and event
+  *  lines for anything that changes. See README.md "Serial protocol".
+  *
   *  Behaviour
-  *    - Tracking is independent of I2C: a dead telemetry bus never stops the servo.
+  *    - Tracking is independent of I2C and of the serial link: a dead telemetry
+  *      bus or an unplugged laptop never stops the servo.
   *    - Boot: centre servo -> if dark, park; otherwise sweep to find the sun.
-  *    - Faults (servo holds position, short press clears):
+  *    - Faults (servo holds position, reported as flt=... and "#EVT FAULT ..."):
   *        runaway : servo keeps moving without the error shrinking
   *                  (wrong PAN_DIR, slipped horn, blocked panel)
   *        LDR     : one channel ~0 while the other is lit (open wire / bad divider)
-  *    - Calibration (hold button > 2 s under uniform light) is stored in flash.
-  *    - 4 s independent watchdog; a watchdog reset is reported over serial.
+  *    - Calibration (hold button > 2 s, or "CAL" from the laptop, under uniform
+  *      light) is stored in flash.
+  *    - 4 s independent watchdog; a watchdog reset is reported in the boot banner.
   *    - Telemetry maths is integer-only (no float printf needed).
   *
-  *  Button: short press = DEMO <-> FIELD (and clears faults), hold > 2 s = calibrate
-  *  Serial: 115200 8N1 periodic telemetry block (500 ms) to laptop
+  *  Button : short press = DEMO <-> FIELD (and clears faults), hold > 2 s = calibrate
+  *  Laptop : text commands MODE / CAL / CLEAR / STATUS (one per line)
   ******************************************************************************
   */
 
@@ -34,6 +40,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdarg.h>
+
+#define HELION_FW_VERSION       "5.0"
 
 typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 
@@ -96,8 +105,12 @@ typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 /* I2C */
 #define I2C_SPEED_HZ            100000
 
-/* Bring-up helper: 1 = firmware only sweeps the servo and shows the pulse
- * width over serial (press button to stop). Use it to find safe limits.     */
+/* Serial link to the laptop (USART1: PA9 TX, PA10 RX) */
+#define SERIAL_BAUD             115200UL
+#define SERIAL_INTERVAL_MS      1000U   /* one telemetry line per interval     */
+
+/* Bring-up helper: 1 = firmware only sweeps the servo and prints the pulse
+ * width on the serial port (press button to stop). Use it to find safe limits. */
 #define SERVO_SWEEP_TEST        0
 
 /* ========================================================================== */
@@ -174,10 +187,16 @@ static uint32_t last_sum = 0;
 
 static uint64_t energy_trk = 0, energy_fix = 0;   /* mV * 0.1 mA * ms   */
 
-static char     ui_msg[22] = "";
-static uint32_t ui_msg_until = 0;
 static uint32_t last_i2c_recover = 0;
 static bool     boot_wdg_reset = false;
+
+/* Serial link state */
+static char     rx_line[16];
+static uint8_t  rx_len = 0;
+static bool     rx_overflow = false;
+static uint32_t last_faults_sent = 0;
+static uint8_t  last_ina_mask_sent = 0xFF;
+static bool     last_parked_sent = false;
 
 /* ========================================================================== */
 /*  Prototypes                                                                 */
@@ -185,7 +204,10 @@ static bool     boot_wdg_reset = false;
 
 void SystemClock_Config(void);
 void Error_Handler(void);
-static void Display_Task(uint32_t now, bool force);
+static void Serial_Write(const char *b, uint16_t n);
+static void Serial_SendTelemetry(void);
+static void Serial_Event(const char *msg);
+static void Toggle_Mode(void);
 
 /* ========================================================================== */
 /*  Small helpers                                                              */
@@ -219,18 +241,11 @@ static int32_t Clamp32(int32_t v, int32_t lo, int32_t hi)
     return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
-static void UART_SendString(const char *s)
+static void Serial_Event(const char *msg)
 {
-    HAL_UART_Transmit(&huart1, (const uint8_t *)s, (uint16_t)strlen(s), 100);
-}
-
-static void Set_UI_Message(const char *msg, uint32_t duration_ms)
-{
-    strncpy(ui_msg, msg, sizeof(ui_msg) - 1);
-    ui_msg[sizeof(ui_msg) - 1] = '\0';
-    ui_msg_until = HAL_GetTick() + duration_ms;
-    UART_SendString(msg);
-    UART_SendString("\r\n");
+    char b[48];
+    int n = snprintf(b, sizeof(b), "#EVT %s\r\n", msg);
+    if (n > 0) { Serial_Write(b, (uint16_t)((n < (int)sizeof(b)) ? n : (int)sizeof(b) - 1)); }
 }
 
 /* ========================================================================== */
@@ -295,7 +310,6 @@ static void I2C_Recover(void)
 
 static bool I2C_Probe(uint8_t addr7)
 {
-    if (addr7 == 0x3C) { return false; }
     return HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr7 << 1), 2, 10) == HAL_OK;
 }
 
@@ -358,6 +372,43 @@ static void Ina_Poll(Ina219_t *d)
         Ina_Clear(d);
         I2C_Recover();
     }
+}
+
+/* ========================================================================== */
+/*  Serial transport (USART1, blocking TX, polled RX)                          */
+/* ========================================================================== */
+
+#ifndef SERIAL_RXNE      /* overridden by the host tests */
+#define SERIAL_RXNE()   __HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)
+#define SERIAL_READ()   ((uint8_t)(huart1.Instance->DR & 0xFFU))
+#endif
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance          = USART1;
+    huart1.Init.BaudRate     = SERIAL_BAUD;
+    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits     = UART_STOPBITS_1;
+    huart1.Init.Parity       = UART_PARITY_NONE;
+    huart1.Init.Mode         = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+    if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
+}
+
+/* TX never blocks on the receiver: a 200-byte line takes ~18 ms at 115200 and
+ * is shifted out whether or not a laptop is connected. */
+static void Serial_Write(const char *b, uint16_t n)
+{
+    HAL_IWDG_Refresh(&hiwdg);
+    (void)HAL_UART_Transmit(&huart1, (uint8_t *)(uintptr_t)b, n, 100);
+    HAL_IWDG_Refresh(&hiwdg);
+}
+
+static bool Serial_ReadByte(uint8_t *c)
+{
+    if (!SERIAL_RXNE()) { return false; }
+    *c = SERIAL_READ();         /* reading DR also clears RXNE and any ORE/FE */
+    return true;
 }
 
 /* ========================================================================== */
@@ -498,16 +549,16 @@ static void Calibrate_Sensor_Offsets(void)
 
     Sample_LDRs(raw, 400, 500);                 /* ~200 ms average */
     if (!Cal_Compute(raw, q)) {
-        Set_UI_Message("CAL FAIL: LIGHT", 4000);
+        Serial_Event("CAL FAIL LIGHT (needs even, not dark, not saturated light)");
         return;
     }
     uint32_t old[2];
     for (int i = 0; i < 2; i++) { old[i] = cal_q[i]; cal_q[i] = q[i]; }
     if (Cal_Save()) {
-        Set_UI_Message("CAL SAVED", 3000);
+        Serial_Event("CAL SAVED");
     } else {
         for (int i = 0; i < 2; i++) { cal_q[i] = old[i]; }
-        Set_UI_Message("CAL FAIL: FLASH", 4000);
+        Serial_Event("CAL FAIL FLASH");
     }
 }
 
@@ -603,7 +654,7 @@ static void Reset_Axes(void)
 static void Run_Sun_Search(void)
 {
     searching = true;
-    Display_Task(HAL_GetTick(), true);
+    Serial_SendTelemetry();          /* show st=SEARCH on the laptop */
 
     uint32_t best = 0;
     uint16_t best_pan = PAN_CENTER_PULSE;
@@ -717,58 +768,154 @@ static void I2C_Maintenance(uint32_t now)
     }
 }
 
-static uint8_t Missing_Devices(void)
-{
-    return (uint8_t)(!ina_trk.online + !ina_sys.online + !ina_fix.online);
-}
-
 /* ========================================================================== */
-/*  Dashboard (Laptop Serial Monitor over USART1 @ 115200 8N1)                 */
+/*  Laptop telemetry                                                           */
+/*                                                                             */
+/*  $HEL,key=value,...*HH\r\n   HH = XOR of every character between $ and *   */
+/*  #...                        free text (banner, events), no checksum        */
 /* ========================================================================== */
 
 static const char *Status_Text(void)
 {
-    if (faults)            { return "FAULT"; }
-    if (searching)         { return "SEARCH"; }
-    if (is_parked)         { return "PARKED"; }
-    if (Missing_Devices()) { return "I2C MISSING"; }
+    if (faults)    { return "FAULT"; }
+    if (searching) { return "SEARCH"; }
+    if (is_parked) { return "PARK"; }
     return "TRACK";
 }
 
-static void Display_Task(uint32_t now, bool force)
+static uint8_t Ina_Mask(void)
+{
+    return (uint8_t)((ina_trk.online ? 1U : 0U) | (ina_sys.online ? 2U : 0U) |
+                     (ina_fix.online ? 4U : 0U));
+}
+
+/* Appends "text" to buf at *n, never past size-1. Returns false when full. */
+static bool Buf_Add(char *buf, size_t size, size_t *n, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *n, size - *n, fmt, ap);
+    va_end(ap);
+    if (w < 0 || (size_t)w >= size - *n) { return false; }
+    *n += (size_t)w;
+    return true;
+}
+
+/* Builds one telemetry line (without CR/LF) into buf. Returns its length. */
+static size_t Telemetry_Format(char *buf, size_t size)
+{
+    size_t n = 0;
+    char gain[12];
+    int32_t g;
+    if (Gain_Tenths(&g)) { snprintf(gain, sizeof(gain), "%ld", (long)g); }
+    else                 { snprintf(gain, sizeof(gain), "na"); }
+
+    (void)Buf_Add(buf, size, &n,
+        "$HEL,t=%lu,mode=%s,st=%s,flt=%lu,az=%ld,pan=%u,sum=%lu,lim=%u,ina=%u,"
+        "tv=%lu,ti=%ld,tp=%lu,fv=%lu,fi=%ld,fp=%lu,sv=%lu,si=%ld,sp=%lu,"
+        "gain=%s,et=%lu,ef=%lu",
+        (unsigned long)(HAL_GetTick() / 1000U),
+        (mode == MODE_DEMO) ? "DEMO" : "FIELD", Status_Text(),
+        (unsigned long)faults, (long)err_az, (unsigned)pan_pulse,
+        (unsigned long)last_sum, ax_pan.at_limit ? 1U : 0U, (unsigned)Ina_Mask(),
+        (unsigned long)ina_trk.mv, (long)ina_trk.ma10, (unsigned long)ina_trk.mw,
+        (unsigned long)ina_fix.mv, (long)ina_fix.ma10, (unsigned long)ina_fix.mw,
+        (unsigned long)ina_sys.mv, (long)ina_sys.ma10, (unsigned long)ina_sys.mw,
+        gain,
+        (unsigned long)(energy_trk / 3600000000ULL),
+        (unsigned long)(energy_fix / 3600000000ULL));
+
+    uint8_t x = 0;
+    for (size_t i = 1; i < n; i++) { x ^= (uint8_t)buf[i]; }
+    (void)Buf_Add(buf, size, &n, "*%02X", (unsigned)x);
+    return n;
+}
+
+static void Serial_SendTelemetry(void)
+{
+    char b[300];
+    size_t n = Telemetry_Format(b, sizeof(b) - 2);
+    b[n++] = '\r'; b[n++] = '\n';
+    Serial_Write(b, (uint16_t)n);
+}
+
+static void Serial_Banner(void)
+{
+    char b[96];
+    int n = snprintf(b, sizeof(b),
+                     "\r\n#HELION single-axis solar tracker fw=%s baud=%lu\r\n",
+                     HELION_FW_VERSION, (unsigned long)SERIAL_BAUD);
+    if (n > 0) { Serial_Write(b, (uint16_t)n); }
+    n = snprintf(b, sizeof(b), "#BOOT ina=%u wdg_reset=%u mode=%s\r\n",
+                 (unsigned)Ina_Mask(), boot_wdg_reset ? 1U : 0U,
+                 (mode == MODE_DEMO) ? "DEMO" : "FIELD");
+    if (n > 0) { Serial_Write(b, (uint16_t)n); }
+    last_ina_mask_sent = Ina_Mask();
+}
+
+/* Commands from the laptop, one per line: MODE, CAL, CLEAR, STATUS. */
+static void Serial_Command(const char *cmd)
+{
+    if      (strcmp(cmd, "MODE") == 0)   { Toggle_Mode(); }
+    else if (strcmp(cmd, "CLEAR") == 0)  { faults = 0; Reset_Axes(); force_track = true;
+                                           Serial_Event("FAULTS CLEARED"); }
+    else if (strcmp(cmd, "CAL") == 0)    { Calibrate_Sensor_Offsets(); }
+    else if (strcmp(cmd, "STATUS") == 0) { Serial_SendTelemetry(); }
+    else                                 { Serial_Event("UNKNOWN COMMAND"); }
+}
+
+static void Serial_RxTask(void)
+{
+    uint8_t c;
+    for (int guard = 0; guard < 64 && Serial_ReadByte(&c); guard++) {
+        if (c == '\r' || c == '\n') {
+            if (rx_len > 0 && !rx_overflow) {
+                rx_line[rx_len] = '\0';
+                Serial_Command(rx_line);
+            } else if (rx_overflow) {
+                Serial_Event("UNKNOWN COMMAND");
+            }
+            rx_len = 0; rx_overflow = false;
+        } else if (rx_len < sizeof(rx_line) - 1U) {
+            rx_line[rx_len++] = (char)toupper((int)c);
+        } else {
+            rx_overflow = true;
+        }
+    }
+}
+
+/* Called every main-loop pass: sends event lines on change and one telemetry
+ * line per SERIAL_INTERVAL_MS. */
+static void Serial_Task(uint32_t now)
 {
     static uint32_t last = 0;
-    if (!force && (now - last) < 500U) { return; }
-    last = now;
 
-    char buf[256];
-    int32_t g = 0;
-    (void)Gain_Tenths(&g);
-    unsigned long et = (unsigned long)(energy_trk / 3600000000ULL);
-    unsigned long ef = (unsigned long)(energy_fix / 3600000000ULL);
+    Serial_RxTask();
 
-    int len = snprintf(buf, sizeof(buf),
-        "HELION,mode=%s,st=%s,az=%+04ld,S=%lu\r\n"
-        "TRK,v_mV=%lu,i_mA=%ld,p_mW=%lu\r\n"
-        "FIX,v_mV=%lu,i_mA=%ld,p_mW=%lu\r\n"
-        "SYS,v_mV=%lu,i_mA=%ld\r\n"
-        "GAIN_x10=%+ld,E_T_x10=%lu,E_F_x10=%lu\r\n",
-        (mode == MODE_DEMO) ? "DEMO" : "FIELD",
-        Status_Text(),
-        (long)err_az,
-        (unsigned long)last_sum,
-        (unsigned long)ina_trk.mv,
-        (long)(ina_trk.ma10 / 10),
-        (unsigned long)ina_trk.mw,
-        (unsigned long)ina_fix.mv,
-        (long)(ina_fix.ma10 / 10),
-        (unsigned long)ina_fix.mw,
-        (unsigned long)ina_sys.mv,
-        (long)(ina_sys.ma10 / 10),
-        (long)g, et, ef);
+    if (faults != last_faults_sent) {
+        if ((faults & FAULT_PAN_RUNAWAY) && !(last_faults_sent & FAULT_PAN_RUNAWAY)) {
+            Serial_Event("FAULT PAN RUNAWAY (check PAN_DIR / horn / blocked panel)");
+        }
+        if ((faults & FAULT_LDR) && !(last_faults_sent & FAULT_LDR)) {
+            Serial_Event("FAULT LDR (open wire or bad divider)");
+        }
+        if (!faults) { Serial_Event("FAULTS CLEARED"); }
+        last_faults_sent = faults;
+    }
+    if (is_parked != last_parked_sent) {
+        Serial_Event(is_parked ? "PARKED (dark)" : "UNPARKED (light)");
+        last_parked_sent = is_parked;
+    }
+    if (Ina_Mask() != last_ina_mask_sent) {
+        char b[40];
+        snprintf(b, sizeof(b), "INA ONLINE MASK %u (7 = all)", (unsigned)Ina_Mask());
+        Serial_Event(b);
+        last_ina_mask_sent = Ina_Mask();
+    }
 
-    if (len > 0) {
-        HAL_UART_Transmit(&huart1, (const uint8_t *)buf, (uint16_t)len, 100);
+    if ((now - last) >= SERIAL_INTERVAL_MS) {
+        last = now;
+        Serial_SendTelemetry();
     }
 }
 
@@ -776,7 +923,23 @@ static void Display_Task(uint32_t now, bool force)
 /*  Button: debounced, non-blocking                                            */
 /*    short press : toggle DEMO/FIELD and clear faults                         */
 /*    hold > 2 s  : calibrate LDR gains                                        */
+/*  (the same actions are available from the laptop: MODE, CAL, CLEAR)        */
 /* ========================================================================== */
+
+/* DEMO <-> FIELD, clears faults. Used by the button and the MODE command. */
+static void Toggle_Mode(void)
+{
+    mode = (mode == MODE_DEMO) ? MODE_FIELD : MODE_DEMO;
+    faults = 0;
+    Reset_Axes();
+    force_track = true;
+    if (mode == MODE_FIELD && FIELD_RELEASE_SERVOS) {
+        release_at = HAL_GetTick() + 1000U; release_pending = true;
+    } else {
+        release_pending = false;
+    }
+    Serial_Event((mode == MODE_DEMO) ? "MODE DEMO" : "MODE FIELD");
+}
 
 static void Button_Task(uint32_t now)
 {
@@ -791,15 +954,7 @@ static void Button_Task(uint32_t now)
         if (stable) {
             press_start = now; long_done = false;
         } else if (!long_done) {                          /* released: short press */
-            mode = (mode == MODE_DEMO) ? MODE_FIELD : MODE_DEMO;
-            faults = 0;
-            Reset_Axes();
-            force_track = true;
-            if (mode == MODE_FIELD && FIELD_RELEASE_SERVOS) {
-                release_at = now + 1000U; release_pending = true;
-            } else {
-                release_pending = false;
-            }
+            Toggle_Mode();
         }
     }
     if (stable && !long_done && (now - press_start) >= 2000U) {
@@ -816,15 +971,17 @@ static void Button_Task(uint32_t now)
 static void Servo_Sweep_Test(void)
 {
     char l[48];
+    Serial_Event("SERVO SWEEP TEST - press the button to stop");
     for (uint16_t half = 100; half <= 600; half = (uint16_t)(half + 50)) {
         for (int dir = 0; dir < 2; dir++) {
             uint16_t p = dir ? (uint16_t)(1500 + half) : (uint16_t)(1500 - half);
             __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, p);
-            snprintf(l, sizeof(l), "SWEEP,pulse_us=%u\r\n", (unsigned)p);
-            UART_SendString(l);
+            snprintf(l, sizeof(l), "SWEEP PULSE %u US", (unsigned)p);
+            Serial_Event(l);
             for (int i = 0; i < 12; i++) {
                 Delay_ms(100);
                 if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) == GPIO_PIN_RESET) {
+                    Serial_Event("SWEEP STOPPED");
                     for (;;) { HAL_IWDG_Refresh(&hiwdg); }
                 }
             }
@@ -843,7 +1000,6 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* Mode / calibrate button on PA4 (internal pull-up) */
     g.Pin = GPIO_PIN_4; g.Mode = GPIO_MODE_INPUT; g.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &g);
 }
@@ -879,19 +1035,6 @@ static void MX_TIM3_Init(void)
     if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
     /* New pulse width takes effect at the next frame: no runt pulse mid-period */
     __HAL_TIM_ENABLE_OCxPRELOAD(&htim3, TIM_CHANNEL_1);
-}
-
-static void MX_USART1_UART_Init(void)
-{
-    huart1.Instance          = USART1;
-    huart1.Init.BaudRate     = 115200;
-    huart1.Init.WordLength   = UART_WORDLENGTH_8B;
-    huart1.Init.StopBits     = UART_STOPBITS_1;
-    huart1.Init.Parity       = UART_PARITY_NONE;
-    huart1.Init.Mode         = UART_MODE_TX_RX;
-    huart1.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
-    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart1) != HAL_OK) { Error_Handler(); }
 }
 
 /* ---- MSP callbacks ---- */
@@ -945,30 +1088,20 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef *h)
     }
 }
 
-void HAL_UART_MspInit(UART_HandleTypeDef *huart)
+void HAL_UART_MspInit(UART_HandleTypeDef *h)
 {
-    if (huart->Instance == USART1) {
+    if (h->Instance == USART1) {
         GPIO_InitTypeDef g = {0};
         __HAL_RCC_USART1_CLK_ENABLE();
         __HAL_RCC_GPIOA_CLK_ENABLE();
-        /* PA9  -> USART1_TX */
-        g.Pin   = GPIO_PIN_9;
+        g.Pin   = GPIO_PIN_9;                  /* TX -> adapter RX */
         g.Mode  = GPIO_MODE_AF_PP;
         g.Speed = GPIO_SPEED_FREQ_HIGH;
         HAL_GPIO_Init(GPIOA, &g);
-        /* PA10 -> USART1_RX */
-        g.Pin   = GPIO_PIN_10;
-        g.Mode  = GPIO_MODE_INPUT;
-        g.Pull  = GPIO_NOPULL;
+        g.Pin   = GPIO_PIN_10;                 /* RX <- adapter TX; pull-up keeps  */
+        g.Mode  = GPIO_MODE_INPUT;             /* the idle level high when the     */
+        g.Pull  = GPIO_PULLUP;                 /* adapter is unplugged             */
         HAL_GPIO_Init(GPIOA, &g);
-    }
-}
-
-void HAL_UART_MspDeInit(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART1) {
-        __HAL_RCC_USART1_CLK_DISABLE();
-        HAL_GPIO_DeInit(GPIOA, GPIO_PIN_9 | GPIO_PIN_10);
     }
 }
 
@@ -999,20 +1132,14 @@ void SystemClock_Config(void)
     if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK) { Error_Handler(); }
 }
 
-/* Init failure (e.g. HSE did not start). Blink PC13 for a few seconds so the
- * fault is visible, then reset and try again: an unattended unit must not
- * sit dead after a transient start-up problem. */
+/* Init failure (e.g. HSE did not start). Wait a couple of seconds, then reset
+ * and try again: an unattended unit must not sit dead after a transient
+ * start-up problem. The pause stops a permanent fault from reset-looping at
+ * full speed. (Clocks may be unusable here, so this is a plain busy loop.) */
 void Error_Handler(void)
 {
-    GPIO_InitTypeDef g = {0};
     __disable_irq();
-    __HAL_RCC_GPIOC_CLK_ENABLE();
-    g.Pin = GPIO_PIN_13; g.Mode = GPIO_MODE_OUTPUT_PP; g.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOC, &g);
-    for (int i = 0; i < 40; i++) {
-        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
-        for (volatile uint32_t d = 0; d < 400000UL; d++) { }
-    }
+    for (volatile uint32_t d = 0; d < 8000000UL; d++) { }
     NVIC_SystemReset();
 }
 
@@ -1032,11 +1159,12 @@ int main(void)
     MX_GPIO_Init();
     MX_ADC1_Init();
     MX_TIM3_Init();
-    MX_USART1_UART_Init();
     HAL_ADCEx_Calibration_Start(&hadc1);
     Cal_Load();
 
-    HAL_Delay(100);                 /* let INA219 finish power-up */
+    MX_USART1_UART_Init();
+
+    HAL_Delay(100);                 /* let the INA219s finish power-up */
     I2C_BusClear();
     MX_I2C1_Init();
 
@@ -1044,16 +1172,6 @@ int main(void)
     for (int i = 0; i < 3; i++) {
         list[i]->online = I2C_Probe(list[i]->addr7) && INA_Init(list[i]);
     }
-
-    char boot_msg[64];
-    UART_SendString("HELION SOLAR TRACKER\r\nSINGLE AXIS\r\n");
-    snprintf(boot_msg, sizeof(boot_msg), "INA1:%s  INA2:%s  INA3:%s\r\n",
-             ina_trk.online ? "OK" : "--",
-             ina_sys.online ? "OK" : "--",
-             ina_fix.online ? "OK" : "--");
-    UART_SendString(boot_msg);
-    if (boot_wdg_reset) { UART_SendString("LAST RESET: WATCHDOG\r\n"); }
-    Delay_ms(2000);
 
 #if SERVO_SWEEP_TEST
     __HAL_DBGMCU_FREEZE_IWDG();
@@ -1069,6 +1187,7 @@ int main(void)
     hiwdg.Init.Reload    = 2500;
     if (HAL_IWDG_Init(&hiwdg) != HAL_OK) { Error_Handler(); }
 
+    Serial_Banner();
     Servo_Boot_Center();
     Delay_ms(600);
 
@@ -1078,6 +1197,8 @@ int main(void)
     last_sum = c0[0] + c0[1];
     if (last_sum < NIGHT_EXIT_ADC_SUM) { Park(); }
     else                               { Run_Sun_Search(); }
+
+    last_parked_sent = is_parked;
 
     uint32_t t_track = HAL_GetTick();
     uint32_t t_telem = HAL_GetTick();
@@ -1102,7 +1223,7 @@ int main(void)
         }
 
         I2C_Maintenance(now);
-        Display_Task(now, false);
+        Serial_Task(now);
     }
 }
 #endif /* HELION_UNIT_TEST */
