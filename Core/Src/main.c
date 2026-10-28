@@ -102,6 +102,13 @@ typedef enum { MODE_DEMO = 0, MODE_FIELD = 1 } TrackerMode;
 #define INA_R_SHUNT_MOHM        100     /* module shunt, milli-ohm            */
 #define INA_CONFIG              0x399F  /* 32 V, +/-320 mV, 12-bit, continuous */
 
+/* 1 = three INA219 power sensors on I2C (full project).
+ * 0 = bare tracker rig (LDRs + servo only): the I2C bus is never touched.
+ * Override from the build system: -DHAVE_INA219=0 (see platformio.ini). */
+#ifndef HAVE_INA219
+#define HAVE_INA219             1
+#endif
+
 /* I2C */
 #define I2C_SPEED_HZ            100000
 
@@ -1164,13 +1171,15 @@ int main(void)
 
     MX_USART1_UART_Init();
 
-    HAL_Delay(100);                 /* let the INA219s finish power-up */
-    I2C_BusClear();
-    MX_I2C1_Init();
+    if (HAVE_INA219) {
+        HAL_Delay(100);             /* let the INA219s finish power-up */
+        I2C_BusClear();
+        MX_I2C1_Init();
 
-    Ina219_t *list[3] = { &ina_trk, &ina_sys, &ina_fix };
-    for (int i = 0; i < 3; i++) {
-        list[i]->online = I2C_Probe(list[i]->addr7) && INA_Init(list[i]);
+        Ina219_t *list[3] = { &ina_trk, &ina_sys, &ina_fix };
+        for (int i = 0; i < 3; i++) {
+            list[i]->online = I2C_Probe(list[i]->addr7) && INA_Init(list[i]);
+        }
     }
 
 #if SERVO_SWEEP_TEST
@@ -1218,11 +1227,11 @@ int main(void)
         }
 
         if ((now - t_telem) >= 500U) {
-            Telemetry_Task(now - t_telem);
+            if (HAVE_INA219) { Telemetry_Task(now - t_telem); }
             t_telem = now;
         }
 
-        I2C_Maintenance(now);
+        if (HAVE_INA219) { I2C_Maintenance(now); }
         Serial_Task(now);
     }
 }
